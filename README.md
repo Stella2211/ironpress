@@ -40,6 +40,20 @@ ironpress compresses JPEG, PNG, WebP, and AVIF images using mozjpeg, oxipng, lib
 - **EXIF metadata preservation** for JPEG-to-JPEG output
 - **Panic-safe batch processing** (one corrupt image never kills the batch)
 
+## What's New in 0.3.0
+
+| Feature | How to use | Cost / trade-off |
+|---|---|---|
+| AVIF output | `format: CompressFormat.avif` | ~39-47% smaller than JPEG, but 2-10× slower to encode depending on `AvifOptions.speed` |
+| Lossy PNG | `png: PngOptions(lossy: true)` | Up to ~3× smaller PNGs, ~1.7× slower than lossless-only; ≤256 colors |
+| EXIF auto-orientation | on by default (`autoOrient: false` to opt out) | Free when no orientation tag; ~2% when a rotation is applied |
+| ICC profile preservation | on by default (`keepIccProfile: false` to opt out) | Output grows by the profile size (typically a few KB); no measurable time cost |
+| HEIC detection | automatic | HEIC input fails with a clear, actionable error instead of a generic one |
+
+Auto-orientation and ICC preservation default to **on** because they fix correctness
+bugs (sideways photos, color shifts on wide-gamut displays). Pass the opt-out flags if
+you need byte-compatible output with 0.2.x.
+
 ## Platform Support
 
 | Platform | Architectures | Status |
@@ -194,8 +208,17 @@ final result = await Ironpress.compressFile(
 );
 ```
 
-AVIF encoding is significantly slower than JPEG or WebP — use `AvifOptions(speed: 8-10)`
-for interactive flows and lower speeds for background/archival work. AVIF is output-only;
+AVIF encoding is significantly slower than JPEG or WebP. Measured on a 2048×1536
+photo (same machine, relative to JPEG q80 with trellis):
+
+| Output | Encode time vs JPEG | Size vs JPEG q80 |
+|---|---|---|
+| AVIF q60, speed 10 | ~2.3× slower | ~39% smaller |
+| AVIF q60, speed 6 (default) | ~10× slower | ~47% smaller |
+
+Use `AvifOptions(speed: 8-10)` for interactive flows and lower speeds for
+background/archival work. Combining AVIF with `maxFileSize` multiplies the cost by up
+to 10 binary-search iterations — prefer high speed settings there. AVIF is output-only;
 AVIF files are not accepted as input.
 
 ### Lossy PNG
@@ -209,8 +232,14 @@ final result = await Ironpress.compressFile(
 ```
 
 Quantizes to a dithered palette of up to 256 colors before oxipng optimization —
-typically 60-80% smaller on screenshots and UI graphics. Photos with fine gradients
-are better served by JPEG, WebP, or AVIF output.
+typically 60-80% smaller on screenshots and UI graphics. On a photo-like 1200×900 PNG
+this measured ~3.2× smaller output for ~1.7× the encode time of the lossless path.
+
+Two caveats: output is limited to 256 colors (dithering hides most banding, but this
+is not for archival masters), and on *simple* flat graphics that already compress
+losslessly to a few KB, lossless mode can win — the dithering noise works against
+PNG's filters there. Photos with fine gradients are better served by JPEG, WebP, or
+AVIF output.
 
 ### Orientation & Color Profiles
 
@@ -224,6 +253,11 @@ Both are on by default because they are correctness fixes, not optimizations:
   input) into JPEG and PNG output. Without it, wide-gamut photos (iPhone Display P3)
   visibly shift color after compression. WebP and AVIF output does not support ICC
   embedding, so the flag has no effect for those formats.
+
+Overhead is negligible: when the input carries no EXIF/ICC the checks are header-only
+scans (within measurement noise), and when a rotation + profile embed actually happens
+the total cost measured ~2% on a 3 MP photo. Output grows by roughly the embedded
+profile size (sRGB ≈ 3 KB, Display P3 ≈ 0.5 KB).
 
 ### Metadata Handling
 
