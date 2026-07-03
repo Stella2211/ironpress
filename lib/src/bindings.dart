@@ -29,6 +29,14 @@ final class NativeCompressParams extends Struct {
   external int jpegTrellis;
   @Uint32()
   external int pngOptimizationLevel;
+  @Uint32()
+  external int pngLossy;
+  @Uint32()
+  external int autoOrient;
+  @Uint32()
+  external int preserveIcc;
+  @Uint32()
+  external int avifSpeed;
 }
 
 /// Mirrors Rust's CompressResult #[repr(C)]

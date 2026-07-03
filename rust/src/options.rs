@@ -12,6 +12,9 @@ pub enum OutputFormat {
     WebpLossless = 3,
     /// WebP output (lossy — often more useful than lossless for photos)
     WebpLossy = 4,
+    /// AVIF output (lossy — ~50% smaller than JPEG at equivalent quality,
+    /// but much slower to encode)
+    Avif = 5,
 }
 
 impl OutputFormat {
@@ -21,6 +24,7 @@ impl OutputFormat {
             2 => Self::Png,
             3 => Self::WebpLossless,
             4 => Self::WebpLossy,
+            5 => Self::Avif,
             _ => Self::Auto,
         }
     }
@@ -76,6 +80,17 @@ pub struct CompressParams {
     pub jpeg_trellis: u32,
     /// PNG optimization level 0-6 (default 2).
     pub png_optimization_level: u32,
+    /// Lossy PNG output: quantize to a palette (up to 256 colors) with
+    /// Floyd–Steinberg dithering before optimization. 1 = true, 0 = false (default).
+    pub png_lossy: u32,
+    /// Physically rotate pixels to match the EXIF orientation tag.
+    /// 1 = true (default), 0 = false.
+    pub auto_orient: u32,
+    /// Preserve the input's ICC color profile in JPEG and PNG output.
+    /// 1 = true (default), 0 = false.
+    pub preserve_icc: u32,
+    /// AVIF encoder speed 1-10. 1 = slowest/smallest, 10 = fastest (default 6).
+    pub avif_speed: u32,
 }
 
 impl Default for CompressParams {
@@ -93,6 +108,10 @@ impl Default for CompressParams {
             jpeg_chroma_subsampling: 0,
             jpeg_trellis: 1,
             png_optimization_level: 2,
+            png_lossy: 0,
+            auto_orient: 1,
+            preserve_icc: 1,
+            avif_speed: 6,
         }
     }
 }

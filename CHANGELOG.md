@@ -1,3 +1,36 @@
+## 0.3.0
+
+### New features
+
+- **AVIF output** (`CompressFormat.avif`) — encoded with rav1e via `ravif`, typically ~50% smaller than JPEG at equivalent visual quality. Integrates with target-size binary search, batch compression, and benchmarks. Tune with `AvifOptions(speed: 1-10)` (default 6). Output-only: AVIF input is not decoded.
+- **Lossy PNG quantization** (`PngOptions(lossy: true)`) — quantizes to a palette of up to 256 colors (NeuQuant) with Floyd–Steinberg dithering before the oxipng pass. Typically 60-80% smaller on screenshots and UI graphics. The main `quality` parameter maps to palette size, which also enables target-size quality search for lossy PNG.
+- **EXIF auto-orientation** (`autoOrient`, default `true`) — pixels are physically rotated to match the EXIF orientation tag (JPEG APP1, PNG eXIf, and WebP EXIF chunks), so portrait photos never come out sideways. When combined with `keepMetadata: true`, the preserved orientation tag is reset to upright so the output is never double-rotated.
+- **ICC color profile preservation** (`keepIccProfile`, default `true`) — the input's ICC profile (JPEG APP2, PNG iCCP, or WebP ICCP) is carried into JPEG and PNG output, fixing color shifts on wide-gamut (Display P3) photos. Applies to both the full encode path and the direct oxipng fast path.
+- **HEIC/HEIF input detection** — HEIC files now fail with a clear, actionable error message instead of a generic "unsupported format". Full HEIC decoding is intentionally not shipped: HEVC decoding requires the patent-encumbered libheif C stack, which has no pure-Rust implementation and would break the zero-toolchain prebuilt binary model.
+
+### Improvements
+
+- `probeFile`/`probeBytes` now detect EXIF in WebP files (previously always reported `false` for WebP)
+- Benchmarks now sweep quality for lossy PNG and AVIF output, and apply EXIF orientation so results match real compression output
+- `ImageFormat` gained an `avif` value for future-proofing
+
+### Behavior changes
+
+- Compressing a rotated (EXIF orientation > 1) image now produces upright pixels by default; pass `autoOrient: false` for the old behavior. Output width/height reflect the rotated image.
+- JPEG/PNG output now retains the input's ICC profile by default; pass `keepIccProfile: false` for the old behavior. Outputs with profiles are slightly larger but color-correct.
+- PNG inputs carrying an EXIF orientation tag (> 1) no longer take the direct oxipng fast path when `autoOrient` is enabled, since rotation requires decoding.
+- Native ABI version bumped to 2 (`CompressParams` gained `png_lossy`, `auto_orient`, `preserve_icc`, `avif_speed`). Prebuilt binaries and Dart are versioned together; stale native libraries fail fast with an ABI mismatch error.
+
+### Tests
+
+- EXIF orientation: TIFF parsing (both byte orders), rotation, tag patching, opt-out
+- ICC: JPEG→JPEG, PNG direct path, PNG re-encode path, JPEG→PNG carry-over, opt-out
+- Lossy PNG: size reduction on photographic content, transparency preservation, target-size search
+- AVIF: container validity, alpha input, target-size search
+- HEIC/AVIF input detection errors
+
+---
+
 ## 0.2.0
 
 ### Performance

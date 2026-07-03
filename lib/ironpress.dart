@@ -10,6 +10,7 @@ export 'src/options.dart'
         CompressPreset,
         JpegOptions,
         PngOptions,
+        AvifOptions,
         CompressInput,
         CancellationToken,
         CompressResult,

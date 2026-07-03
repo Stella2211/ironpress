@@ -538,6 +538,46 @@ void main() {
       expect(result.isSuccess, isTrue);
       expect(result.data![0], 0x89); // PNG signature
     });
+
+    test('JPEG input → AVIF output', () async {
+      CompressResult result;
+      try {
+        result = await Ironpress.compressBytes(
+          _syntheticJpeg(),
+          quality: 60,
+          format: CompressFormat.avif,
+          avif: const AvifOptions(speed: 10),
+        );
+      } on StateError catch (_) {
+        markTestSkipped('Native library not available');
+        return;
+      }
+
+      expect(result.isSuccess, isTrue);
+      final data = result.data!;
+      // ISO-BMFF container: "ftypavif" at offset 4
+      expect(String.fromCharCodes(data.sublist(4, 12)), 'ftypavif');
+    });
+  });
+
+  group('Integration — lossy PNG', () {
+    test('lossy PNG output is a valid PNG', () async {
+      CompressResult result;
+      try {
+        result = await Ironpress.compressBytes(
+          _syntheticPng(),
+          format: CompressFormat.png,
+          png: const PngOptions(lossy: true),
+        );
+      } on StateError catch (_) {
+        markTestSkipped('Native library not available');
+        return;
+      }
+
+      expect(result.isSuccess, isTrue);
+      expect(result.data![0], 0x89); // PNG signature
+      expect(result.width, greaterThan(0));
+    });
   });
 
   group('Integration — target file size', () {

@@ -163,6 +163,33 @@ void main() {
         throwsA(isA<ArgumentError>()),
       );
     });
+
+    test('compressBytes validates avif speed before native call', () {
+      expect(
+        () => Ironpress.compressBytes(
+          Uint8List(1),
+          avif: const AvifOptions(speed: 0),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => Ironpress.compressBytes(
+          Uint8List(1),
+          avif: const AvifOptions(speed: 11),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('compressFile validates avif speed before native call', () {
+      expect(
+        () => Ironpress.compressFile(
+          '/photo.jpg',
+          avif: const AvifOptions(speed: 42),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
   });
 
   group('Quality range validation', () {

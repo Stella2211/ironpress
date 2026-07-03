@@ -162,6 +162,17 @@ void main() {
       const opts = PngOptions();
       expect(opts.optimizationLevel, 2);
     });
+
+    test('lossy quantization is opt-in', () {
+      expect(const PngOptions().lossy, false);
+      expect(const PngOptions(lossy: true).lossy, true);
+    });
+  });
+
+  group('AvifOptions', () {
+    test('default speed is balanced', () {
+      expect(const AvifOptions().speed, 6);
+    });
   });
 
   group('CompressInput', () {
@@ -186,6 +197,7 @@ void main() {
       expect(CompressFormat.png.value, 2);
       expect(CompressFormat.webpLossless.value, 3);
       expect(CompressFormat.webpLossy.value, 4);
+      expect(CompressFormat.avif.value, 5);
     });
   });
 
@@ -194,12 +206,14 @@ void main() {
       expect(ImageFormat.fromValue(1), ImageFormat.jpeg);
       expect(ImageFormat.fromValue(2), ImageFormat.png);
       expect(ImageFormat.fromValue(3), ImageFormat.webp);
+      expect(ImageFormat.fromValue(5), ImageFormat.avif);
     });
 
     test('name returns readable string', () {
       expect(ImageFormat.jpeg.name, 'JPEG');
       expect(ImageFormat.png.name, 'PNG');
       expect(ImageFormat.webp.name, 'WebP');
+      expect(ImageFormat.avif.name, 'AVIF');
     });
 
     test('unknown value throws instead of silently defaulting', () {

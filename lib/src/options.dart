@@ -30,7 +30,12 @@ enum CompressFormat {
 
   /// WebP lossy — quality-based, often more useful than lossless for photos.
   /// Typically smaller than JPEG at equivalent visual quality.
-  webpLossy(4);
+  webpLossy(4),
+
+  /// AVIF — modern format, typically ~50% smaller than JPEG at equivalent
+  /// visual quality. Encoding is significantly slower than JPEG/WebP;
+  /// tune with [AvifOptions.speed]. Output only — AVIF input is not decoded.
+  avif(5);
 
   const CompressFormat(this.value);
   final int value;
@@ -81,7 +86,7 @@ class JpegOptions {
 /// Advanced PNG optimization options.
 @immutable
 class PngOptions {
-  const PngOptions({this.optimizationLevel = 2});
+  const PngOptions({this.optimizationLevel = 2, this.lossy = false});
 
   /// Optimization level 0-6. Higher = slower but smaller output.
   ///
@@ -89,6 +94,27 @@ class PngOptions {
   /// - 2: Good balance (default)
   /// - 6: Maximum compression (slowest)
   final int optimizationLevel;
+
+  /// Enable lossy palette quantization (up to 256 colors, Floyd–Steinberg
+  /// dithered) before optimization. Typically shrinks screenshots and UI
+  /// graphics by 60-80% versus lossless-only optimization.
+  ///
+  /// The main `quality` parameter controls the palette size: higher quality
+  /// keeps more colors. Default: `false` (lossless).
+  final bool lossy;
+}
+
+/// Advanced AVIF encoding options.
+@immutable
+class AvifOptions {
+  const AvifOptions({this.speed = 6});
+
+  /// Encoder speed 1-10. Lower is slower but compresses better.
+  ///
+  /// - 1-3: Very slow, best compression (archival)
+  /// - 6: Good balance (default)
+  /// - 10: Fastest, larger output
+  final int speed;
 }
 
 // ─── Quality Presets ─────────────────────────────────────────────────────────
@@ -385,7 +411,8 @@ class BatchCompressResult {
 enum ImageFormat {
   jpeg(1),
   png(2),
-  webp(3);
+  webp(3),
+  avif(5);
 
   const ImageFormat(this.value);
   final int value;
@@ -400,6 +427,8 @@ enum ImageFormat {
         return webp;
       case 4:
         return webp;
+      case 5:
+        return avif;
       default:
         throw StateError('Unknown native image format value: $v');
     }
@@ -413,6 +442,8 @@ enum ImageFormat {
         return 'PNG';
       case webp:
         return 'WebP';
+      case avif:
+        return 'AVIF';
     }
   }
 }

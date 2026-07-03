@@ -24,6 +24,7 @@ Complete API documentation for the `ironpress` Flutter plugin.
   - [CompressFormat](#compressformat)
   - [JpegOptions](#jpegoptions)
   - [PngOptions](#pngoptions)
+  - [AvifOptions](#avifoptions)
   - [ChromaSubsampling](#chromasubsampling)
   - [CompressPreset](#compresspreset)
 - [Input & Output](#input--output)
@@ -66,8 +67,11 @@ static Future<CompressResult> compressFile(
   bool allowResize = true,
   CompressFormat format = CompressFormat.auto,
   bool keepMetadata = false,
+  bool keepIccProfile = true,
+  bool autoOrient = true,
   JpegOptions jpeg = const JpegOptions(),
   PngOptions png = const PngOptions(),
+  AvifOptions avif = const AvifOptions(),
 })
 ```
 
@@ -85,8 +89,11 @@ static Future<CompressResult> compressFile(
 | `allowResize` | `bool` | `true` | If quality alone can't reach `maxFileSize`, allow automatic downscaling. |
 | `format` | `CompressFormat` | `auto` | Output format. |
 | `keepMetadata` | `bool` | `false` | Preserve JPEG EXIF metadata (JPEG→JPEG only, silently ignored otherwise). |
+| `keepIccProfile` | `bool` | `true` | Preserve the input's ICC color profile in JPEG/PNG output. Prevents color shifts on wide-gamut (Display P3) photos. |
+| `autoOrient` | `bool` | `true` | Physically rotate pixels to match the EXIF orientation tag so portrait photos never come out sideways. With `keepMetadata`, the preserved orientation tag is reset to upright. |
 | `jpeg` | `JpegOptions` | `JpegOptions()` | Advanced JPEG options. |
-| `png` | `PngOptions` | `PngOptions()` | Advanced PNG options. |
+| `png` | `PngOptions` | `PngOptions()` | Advanced PNG options (including lossy quantization). |
+| `avif` | `AvifOptions` | `AvifOptions()` | Advanced AVIF options. Used when `format` is `CompressFormat.avif`. |
 
 **Returns:** `Future<CompressResult>` with compressed bytes and stats.
 
@@ -202,8 +209,11 @@ static Future<BatchCompressResult> compressBatch(
   bool allowResize = true,
   CompressFormat format = CompressFormat.auto,
   bool keepMetadata = false,
+  bool keepIccProfile = true,
+  bool autoOrient = true,
   JpegOptions jpeg = const JpegOptions(),
   PngOptions png = const PngOptions(),
+  AvifOptions avif = const AvifOptions(),
   int threadCount = 0,
   int chunkSize = 8,
   void Function(int completed, int total)? onProgress,
@@ -366,9 +376,10 @@ Output image format.
 enum CompressFormat {
   auto,         // Keep same format as input (default)
   jpeg,         // JPEG — lossy, best for photos
-  png,          // PNG — lossless
+  png,          // PNG — lossless (or lossy with PngOptions.lossy)
   webpLossless, // WebP lossless — typically 25-35% smaller than PNG
   webpLossy,    // WebP lossy — often smaller than JPEG at same quality
+  avif,         // AVIF — ~50% smaller than JPEG, slower to encode. Output only.
 }
 ```
 
@@ -399,12 +410,31 @@ const JpegOptions({
 Advanced PNG optimization options.
 
 ```dart
-const PngOptions({int optimizationLevel = 2})
+const PngOptions({int optimizationLevel = 2, bool lossy = false})
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `optimizationLevel` | `int` | `2` | Optimization level 0–6. `0` = no optimization (fastest), `2` = good balance, `6` = maximum compression (slowest). |
+| `lossy` | `bool` | `false` | Quantize to a palette of up to 256 colors with Floyd–Steinberg dithering before optimization. Typically 60-80% smaller on screenshots and UI graphics. The main `quality` parameter controls the palette size. |
+
+---
+
+### AvifOptions
+
+Advanced AVIF encoding options. Only used when `format` is `CompressFormat.avif`.
+
+```dart
+const AvifOptions({int speed = 6})
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `speed` | `int` | `6` | Encoder speed 1–10. `1-3` = very slow, best compression (archival), `6` = good balance, `10` = fastest, larger output. |
+
+AVIF encoding is significantly slower than JPEG or WebP — expect seconds rather than
+milliseconds for large photos at low speed settings. AVIF is an **output-only** format:
+AVIF files are not accepted as input.
 
 ---
 

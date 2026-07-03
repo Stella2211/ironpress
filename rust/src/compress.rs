@@ -6,7 +6,9 @@ use mozjpeg_rs::{Preset, Subsampling, TrellisConfig};
 use oxipng::StripChunks;
 
 use crate::error::CompressError;
+use crate::metadata;
 use crate::options::{ChromaSubsampling, CompressParams, OutputFormat};
+use crate::quantize;
 
 // ─── Fast JPEG Decoding ─────────────────────────────────────────────────────
 
@@ -156,8 +158,7 @@ fn input_format_hint(data: &[u8]) -> Option<ImageFormat> {
         return Some(ImageFormat::Jpeg);
     }
 
-    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47
-    {
+    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
         return Some(ImageFormat::Png);
     }
 
@@ -238,6 +239,7 @@ fn can_direct_optimize_png(
         && params.max_width == 0
         && params.max_height == 0
         && params.max_file_size == 0
+        && params.png_lossy == 0
         && !is_apng(input)
 }
 
@@ -269,6 +271,8 @@ pub enum DetectedFormat {
     Png,
     WebpLossless,
     WebpLossy,
+    /// Output-only: AVIF input decoding is not supported.
+    Avif,
 }
 
 /// Pre-converted pixel buffer to avoid redundant `to_rgb8()`/`to_rgba8()`
@@ -343,12 +347,100 @@ fn prepared_rgba(img: &DynamicImage) -> PreparedPixels {
 fn prepare_pixels(img: &DynamicImage, format: DetectedFormat) -> PreparedPixels {
     match format {
         DetectedFormat::Jpeg => prepared_rgb(img),
-        DetectedFormat::WebpLossless | DetectedFormat::WebpLossy => match img {
-            DynamicImage::ImageRgb8(_) => prepared_rgb(img),
-            _ => prepared_rgba(img),
-        },
+        DetectedFormat::WebpLossless | DetectedFormat::WebpLossy | DetectedFormat::Avif => {
+            match img {
+                DynamicImage::ImageRgb8(_) => prepared_rgb(img),
+                _ => prepared_rgba(img),
+            }
+        }
         DetectedFormat::Png => prepared_rgba(img),
     }
+}
+
+/// Metadata carried from the input container into the encoded output.
+#[derive(Default)]
+pub struct MetaPayload {
+    /// Raw TIFF EXIF payload for JPEG output. When pixels were physically
+    /// rotated, the orientation tag inside has already been reset to upright.
+    exif: Option<Vec<u8>>,
+    /// ICC color profile, embedded into JPEG and PNG output.
+    icc: Option<Vec<u8>>,
+}
+
+fn is_png_bytes(data: &[u8]) -> bool {
+    data.len() >= 8 && data.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+fn is_webp_bytes(data: &[u8]) -> bool {
+    data.len() >= 16 && data[0..4] == *b"RIFF" && data[8..12] == *b"WEBP"
+}
+
+/// Pull the raw EXIF (TIFF) payload out of whichever container the input is.
+fn extract_input_exif(input: &[u8]) -> Option<Vec<u8>> {
+    if is_native_jpeg(input) {
+        metadata::jpeg_extract_exif(input)
+    } else if is_png_bytes(input) {
+        metadata::png_extract_exif(input)
+    } else if is_webp_bytes(input) {
+        metadata::webp_extract_exif(input)
+    } else {
+        None
+    }
+}
+
+/// Pull the ICC color profile out of whichever container the input is.
+fn extract_input_icc(input: &[u8]) -> Option<Vec<u8>> {
+    if is_native_jpeg(input) {
+        metadata::jpeg_extract_icc(input)
+    } else if is_png_bytes(input) {
+        metadata::png_extract_icc(input)
+    } else if is_webp_bytes(input) {
+        metadata::webp_extract_icc(input)
+    } else {
+        None
+    }
+}
+
+/// EXIF orientation of the input (JPEG APP1, PNG eXIf, or WebP EXIF chunk).
+fn extract_input_orientation(input: &[u8]) -> Option<u16> {
+    let tiff = extract_input_exif(input)?;
+    metadata::exif_orientation(&tiff)
+}
+
+fn build_meta(
+    input: &[u8],
+    detected: DetectedFormat,
+    output_format: DetectedFormat,
+    params: &CompressParams,
+    rotated: bool,
+) -> MetaPayload {
+    let mut meta = MetaPayload::default();
+
+    // Full EXIF preservation is only supported for JPEG→JPEG; for all other
+    // format combinations metadata is silently dropped.
+    if params.keep_metadata != 0
+        && detected == DetectedFormat::Jpeg
+        && output_format == DetectedFormat::Jpeg
+        && is_native_jpeg(input)
+    {
+        let mut exif = metadata::jpeg_extract_exif(input);
+        if rotated {
+            if let Some(tiff) = exif.as_mut() {
+                metadata::patch_exif_orientation_to_upright(tiff);
+            }
+        }
+        meta.exif = exif;
+    }
+
+    // ICC profiles ride along independently of keep_metadata — dropping them
+    // visibly shifts colors on wide-gamut (Display P3) photos.
+    if params.preserve_icc != 0
+        && matches!(output_format, DetectedFormat::Jpeg | DetectedFormat::Png)
+    {
+        meta.icc = extract_input_icc(input);
+    }
+
+    meta
 }
 
 /// Internal result from the compression engine.
@@ -371,21 +463,47 @@ pub fn compress_bytes(
     let original_format = detect_format(input)?;
     let output_format = resolve_output_format(params, original_format);
 
-    if can_direct_optimize_png(input, original_format, output_format, params) {
-        return optimize_png_direct(input, params);
+    // Orientation values > 1 mean the stored pixels need rotating.
+    let orientation = if params.auto_orient != 0 {
+        extract_input_orientation(input).filter(|&o| o > 1)
+    } else {
+        None
+    };
+
+    // The direct oxipng path never decodes pixels, so it can't rotate them.
+    if orientation.is_none()
+        && can_direct_optimize_png(input, original_format, output_format, params)
+    {
+        let mut result = optimize_png_direct(input, params)?;
+        if params.preserve_icc != 0 {
+            if let Some(icc) = metadata::png_extract_icc(input) {
+                result.data = metadata::png_insert_iccp(result.data, &icc);
+            }
+        }
+        return Ok(result);
     }
 
     let img = decode_image_with_hint(input, original_format)?;
-    let jpeg_exif = resolve_jpeg_exif_payload(input, original_format, output_format, params)?;
+    let img = match orientation {
+        Some(o) => metadata::apply_orientation(img, o),
+        None => img,
+    };
+    let meta = build_meta(
+        input,
+        original_format,
+        output_format,
+        params,
+        orientation.is_some(),
+    );
 
     // Apply explicit resize constraints first
     let img = apply_resize_constraints(&img, params.max_width, params.max_height);
 
     if params.max_file_size > 0 {
-        compress_to_target_size(&img, params, output_format, jpeg_exif.as_deref())
+        compress_to_target_size(&img, params, output_format, &meta)
     } else {
         let quality = params.quality.min(100) as u8;
-        let encoded = encode_image(&img, quality, output_format, params, jpeg_exif.as_deref())?;
+        let encoded = encode_image(&img, quality, output_format, params, &meta)?;
         let (w, h) = img.dimensions();
         Ok(EngineResult {
             data: encoded,
@@ -404,13 +522,13 @@ fn compress_to_target_size(
     original_img: &DynamicImage,
     params: &CompressParams,
     output_format: DetectedFormat,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<EngineResult, CompressError> {
     let target = params.max_file_size as usize;
     let min_q = params.min_quality.min(100) as u8;
     let initial_q = params.quality.min(100) as u8;
     let allow_resize = params.allow_resize != 0;
-    let quality_search = supports_quality_search(output_format);
+    let quality_search = supports_quality_search(output_format, params);
 
     let mut img = Cow::Borrowed(original_img);
     let mut total_iterations: u32 = 0;
@@ -423,7 +541,7 @@ fn compress_to_target_size(
     for _resize_cycle in 0..MAX_RESIZE_CYCLES {
         // First, try at the requested quality — often it's already small enough
         let initial_encoded =
-            encode_image_prepared(&prepared, &img, initial_q, output_format, params, jpeg_exif)?;
+            encode_image_prepared(&prepared, &img, initial_q, output_format, params, meta)?;
         total_iterations += 1;
 
         if initial_encoded.len() <= target {
@@ -460,7 +578,7 @@ fn compress_to_target_size(
                 target,
                 output_format,
                 params,
-                jpeg_exif,
+                meta,
             )?;
             total_iterations += search_result.iterations;
 
@@ -479,14 +597,8 @@ fn compress_to_target_size(
             // Even min_quality didn't fit — try resize if allowed
             if !allow_resize {
                 // Encode at min quality as best effort
-                let fallback = encode_image_prepared(
-                    &prepared,
-                    &img,
-                    min_q,
-                    output_format,
-                    params,
-                    jpeg_exif,
-                )?;
+                let fallback =
+                    encode_image_prepared(&prepared, &img, min_q, output_format, params, meta)?;
                 total_iterations += 1;
                 let (w, h) = prepared.dimensions();
                 return Ok(EngineResult {
@@ -517,14 +629,7 @@ fn compress_to_target_size(
     }
 
     let fallback_q = if quality_search { min_q } else { initial_q };
-    let fallback = encode_image_prepared(
-        &prepared,
-        &img,
-        fallback_q,
-        output_format,
-        params,
-        jpeg_exif,
-    )?;
+    let fallback = encode_image_prepared(&prepared, &img, fallback_q, output_format, params, meta)?;
     total_iterations += 1;
     let (w, h) = prepared.dimensions();
     Ok(EngineResult {
@@ -537,8 +642,13 @@ fn compress_to_target_size(
     })
 }
 
-fn supports_quality_search(format: DetectedFormat) -> bool {
-    matches!(format, DetectedFormat::Jpeg | DetectedFormat::WebpLossy)
+fn supports_quality_search(format: DetectedFormat, params: &CompressParams) -> bool {
+    match format {
+        DetectedFormat::Jpeg | DetectedFormat::WebpLossy | DetectedFormat::Avif => true,
+        // Lossy PNG maps quality to palette size, so searching works.
+        DetectedFormat::Png => params.png_lossy != 0,
+        DetectedFormat::WebpLossless => false,
+    }
 }
 
 struct SearchResult {
@@ -555,7 +665,7 @@ fn binary_search_quality(
     target: usize,
     output_format: DetectedFormat,
     params: &CompressParams,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<SearchResult, CompressError> {
     let mut lo = lo_init;
     let mut hi = hi_init;
@@ -564,7 +674,7 @@ fn binary_search_quality(
 
     while lo <= hi && iterations < MAX_BINARY_SEARCH_ITERATIONS {
         let mid = lo + (hi - lo) / 2;
-        let encoded = encode_image_prepared(prepared, img, mid, output_format, params, jpeg_exif)?;
+        let encoded = encode_image_prepared(prepared, img, mid, output_format, params, meta)?;
         iterations += 1;
 
         if encoded.len() <= target {
@@ -595,13 +705,14 @@ fn encode_image(
     quality: u8,
     format: DetectedFormat,
     params: &CompressParams,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<Vec<u8>, CompressError> {
     match format {
-        DetectedFormat::Jpeg => encode_jpeg(img, quality, params, jpeg_exif),
-        DetectedFormat::Png => encode_png(img, params),
+        DetectedFormat::Jpeg => encode_jpeg(img, quality, params, meta),
+        DetectedFormat::Png => encode_png(img, quality, params, meta),
         DetectedFormat::WebpLossless => encode_webp_lossless(img, params),
         DetectedFormat::WebpLossy => encode_webp_lossy(img, quality),
+        DetectedFormat::Avif => encode_avif(img, quality, params),
     }
 }
 
@@ -615,7 +726,7 @@ fn encode_image_prepared(
     quality: u8,
     format: DetectedFormat,
     params: &CompressParams,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<Vec<u8>, CompressError> {
     match format {
         DetectedFormat::Jpeg => {
@@ -625,12 +736,21 @@ fn encode_image_prepared(
                 height,
             } = prepared
             {
-                encode_jpeg_raw(data, *width, *height, quality, params, jpeg_exif)
+                encode_jpeg_raw(data, *width, *height, quality, params, meta)
             } else {
-                encode_jpeg(img, quality, params, jpeg_exif)
+                encode_jpeg(img, quality, params, meta)
             }
         }
-        DetectedFormat::Png => encode_png(img, params),
+        DetectedFormat::Png => match prepared {
+            PreparedPixels::Rgba {
+                data,
+                width,
+                height,
+            } if params.png_lossy != 0 => {
+                encode_png_lossy_raw(data, *width, *height, quality, params, meta)
+            }
+            _ => encode_png(img, quality, params, meta),
+        },
         DetectedFormat::WebpLossless => match prepared {
             PreparedPixels::Rgb {
                 data,
@@ -655,6 +775,18 @@ fn encode_image_prepared(
                 height,
             } => encode_webp_lossy_rgba_raw(data, *width, *height, quality),
         },
+        DetectedFormat::Avif => match prepared {
+            PreparedPixels::Rgb {
+                data,
+                width,
+                height,
+            } => encode_avif_rgb_raw(data, *width, *height, quality, params),
+            PreparedPixels::Rgba {
+                data,
+                width,
+                height,
+            } => encode_avif_rgba_raw(data, *width, *height, quality, params),
+        },
     }
 }
 
@@ -662,7 +794,7 @@ fn encode_jpeg(
     img: &DynamicImage,
     quality: u8,
     params: &CompressParams,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<Vec<u8>, CompressError> {
     // Avoid redundant allocation when image is already RGB8 (common after decode_jpeg_fast).
     // For a 4K image this saves ~36 MB of heap allocation per encode call.
@@ -679,7 +811,7 @@ fn encode_jpeg(
         }
     };
 
-    encode_jpeg_raw(pixels, width, height, quality, params, jpeg_exif)
+    encode_jpeg_raw(pixels, width, height, quality, params, meta)
 }
 
 /// JPEG encoding from pre-converted RGB8 pixel data.
@@ -689,7 +821,7 @@ fn encode_jpeg_raw(
     height: u32,
     quality: u8,
     params: &CompressParams,
-    jpeg_exif: Option<&[u8]>,
+    meta: &MetaPayload,
 ) -> Result<Vec<u8>, CompressError> {
     let use_trellis = params.jpeg_trellis != 0;
     let progressive = params.jpeg_progressive != 0;
@@ -719,8 +851,11 @@ fn encode_jpeg_raw(
         .subsampling(chroma)
         .trellis(trellis);
 
-    if let Some(exif) = jpeg_exif {
-        encoder = encoder.exif_data(exif.to_vec());
+    if let Some(exif) = &meta.exif {
+        encoder = encoder.exif_data(exif.clone());
+    }
+    if let Some(icc) = &meta.icc {
+        encoder = encoder.icc_profile(icc.clone());
     }
 
     let data = encoder
@@ -730,7 +865,18 @@ fn encode_jpeg_raw(
     Ok(data)
 }
 
-fn encode_png(img: &DynamicImage, params: &CompressParams) -> Result<Vec<u8>, CompressError> {
+fn encode_png(
+    img: &DynamicImage,
+    quality: u8,
+    params: &CompressParams,
+    meta: &MetaPayload,
+) -> Result<Vec<u8>, CompressError> {
+    if params.png_lossy != 0 {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        return encode_png_lossy_raw(rgba.as_raw(), w, h, quality, params, meta);
+    }
+
     // Pre-allocate based on image size to reduce reallocation during encoding.
     let (w, h) = img.dimensions();
     let estimated = (w as usize * h as usize * 4) / 2;
@@ -739,13 +885,94 @@ fn encode_png(img: &DynamicImage, params: &CompressParams) -> Result<Vec<u8>, Co
     img.write_to(&mut cursor, ImageFormat::Png)
         .map_err(|e| CompressError::EncodeError(format!("PNG encode failed: {e}")))?;
 
-    // Then optimize with oxipng
+    optimize_and_finish_png(&buf, params, meta)
+}
+
+/// Lossy PNG from pre-converted RGBA8 pixel data: palette quantization with
+/// dithering, then the regular oxipng pass.
+fn encode_png_lossy_raw(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    params: &CompressParams,
+    meta: &MetaPayload,
+) -> Result<Vec<u8>, CompressError> {
+    let indexed = quantize::encode_indexed_png(pixels, width, height, quality as u32)?;
+    optimize_and_finish_png(&indexed, params, meta)
+}
+
+/// Shared oxipng pass + ICC re-insertion for all PNG output paths.
+fn optimize_and_finish_png(
+    encoded: &[u8],
+    params: &CompressParams,
+    meta: &MetaPayload,
+) -> Result<Vec<u8>, CompressError> {
     let opt_level = oxipng::Options::from_preset(params.png_optimization_level.min(6) as u8);
 
-    let optimized = oxipng::optimize_from_memory(&buf, &opt_level)
+    let optimized = oxipng::optimize_from_memory(encoded, &opt_level)
         .map_err(|e| CompressError::EncodeError(format!("PNG optimization failed: {e}")))?;
 
-    Ok(optimized)
+    Ok(match &meta.icc {
+        Some(icc) => metadata::png_insert_iccp(optimized, icc),
+        None => optimized,
+    })
+}
+
+// ─── AVIF Encoding ───────────────────────────────────────────────────────────
+
+fn avif_encoder(quality: u8, params: &CompressParams) -> ravif::Encoder {
+    ravif::Encoder::new()
+        .with_quality(quality.clamp(1, 100) as f32)
+        .with_speed(params.avif_speed.clamp(1, 10) as u8)
+}
+
+fn encode_avif(
+    img: &DynamicImage,
+    quality: u8,
+    params: &CompressParams,
+) -> Result<Vec<u8>, CompressError> {
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            encode_avif_rgb_raw(rgb.as_raw(), rgb.width(), rgb.height(), quality, params)
+        }
+        other => {
+            let rgba = other.to_rgba8();
+            encode_avif_rgba_raw(rgba.as_raw(), rgba.width(), rgba.height(), quality, params)
+        }
+    }
+}
+
+fn encode_avif_rgb_raw(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    params: &CompressParams,
+) -> Result<Vec<u8>, CompressError> {
+    use rgb::FromSlice;
+
+    let img = ravif::Img::new(pixels.as_rgb(), width as usize, height as usize);
+    let encoded = avif_encoder(quality, params)
+        .encode_rgb(img)
+        .map_err(|e| CompressError::EncodeError(format!("AVIF encode failed: {e}")))?;
+    Ok(encoded.avif_file)
+}
+
+fn encode_avif_rgba_raw(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    params: &CompressParams,
+) -> Result<Vec<u8>, CompressError> {
+    use rgb::FromSlice;
+
+    let img = ravif::Img::new(pixels.as_rgba(), width as usize, height as usize);
+    let encoded = avif_encoder(quality, params)
+        .encode_rgba(img)
+        .map_err(|e| CompressError::EncodeError(format!("AVIF encode failed: {e}")))?;
+    Ok(encoded.avif_file)
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
@@ -791,6 +1018,38 @@ pub(crate) fn detect_format(data: &[u8]) -> Result<DetectedFormat, CompressError
         return Ok(DetectedFormat::Jpeg);
     }
 
+    // ISO-BMFF (HEIC/HEIF/AVIF): "ftyp" box at offset 4. Recognized so the
+    // error can say what the file is and what to do about it.
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        let brand = &data[8..12];
+        if matches!(brand, b"avif" | b"avis") {
+            return Err(CompressError::UnsupportedFormat(
+                "AVIF input is not supported; ironpress can write AVIF but not read it".into(),
+            ));
+        }
+        if matches!(
+            brand,
+            b"heic"
+                | b"heix"
+                | b"hevc"
+                | b"hevx"
+                | b"heim"
+                | b"heis"
+                | b"hevm"
+                | b"hevs"
+                | b"mif1"
+                | b"msf1"
+        ) {
+            return Err(CompressError::UnsupportedFormat(
+                "HEIC/HEIF input is not supported (HEVC decoding requires the \
+                 patent-encumbered libheif C stack). Request JPEG from the platform \
+                 image picker instead — e.g. image_picker on iOS already transcodes \
+                 HEIC to JPEG"
+                    .into(),
+            ));
+        }
+    }
+
     Err(CompressError::UnsupportedFormat(
         "Unsupported format. Supported inputs: JPEG, PNG, WebP, GIF, BMP, TIFF".into(),
     ))
@@ -803,6 +1062,7 @@ fn resolve_output_format(params: &CompressParams, detected: DetectedFormat) -> D
         OutputFormat::Png => DetectedFormat::Png,
         OutputFormat::WebpLossless => DetectedFormat::WebpLossless,
         OutputFormat::WebpLossy => DetectedFormat::WebpLossy,
+        OutputFormat::Avif => DetectedFormat::Avif,
     }
 }
 
@@ -939,11 +1199,13 @@ pub fn probe_bytes(data: &[u8]) -> Result<ProbeInfo, CompressError> {
         .into_dimensions()
         .map_err(|e| CompressError::DecodeError(format!("Failed to read dimensions: {e}")))?;
 
-    // Simple EXIF detection: search for EXIF marker in JPEG (APP1 segment with "Exif\0\0")
+    // Structured EXIF detection per container (marker segments / chunks only,
+    // never compressed data, to avoid false positives).
     let has_exif = match format {
-        DetectedFormat::Jpeg => detect_exif_jpeg(data),
-        DetectedFormat::Png => detect_exif_png(data),
-        DetectedFormat::WebpLossless | DetectedFormat::WebpLossy => false,
+        DetectedFormat::Jpeg => metadata::jpeg_has_exif(data),
+        DetectedFormat::Png => metadata::png_has_exif(data),
+        DetectedFormat::WebpLossless | DetectedFormat::WebpLossy => metadata::webp_has_exif(data),
+        DetectedFormat::Avif => false,
     };
 
     Ok(ProbeInfo {
@@ -953,98 +1215,6 @@ pub fn probe_bytes(data: &[u8]) -> Result<ProbeInfo, CompressError> {
         file_size: data.len(),
         has_exif,
     })
-}
-
-/// Detect EXIF in JPEG by parsing marker segments using length fields.
-/// Only walks marker segments (not compressed data) to avoid false positives.
-fn detect_exif_jpeg(data: &[u8]) -> bool {
-    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-        return false;
-    }
-
-    let mut offset = 2usize;
-    while offset + 4 <= data.len() {
-        if data[offset] != 0xFF {
-            break;
-        }
-
-        // Skip padding 0xFF bytes
-        let mut marker_offset = offset + 1;
-        while marker_offset < data.len() && data[marker_offset] == 0xFF {
-            marker_offset += 1;
-        }
-        if marker_offset >= data.len() {
-            break;
-        }
-
-        let marker = data[marker_offset];
-        offset = marker_offset + 1;
-
-        // SOS or EOI — no more metadata markers
-        if marker == 0xDA || marker == 0xD9 {
-            break;
-        }
-
-        // Standalone markers (no length field)
-        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
-            continue;
-        }
-
-        // Read segment length
-        if offset + 2 > data.len() {
-            break;
-        }
-        let segment_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        if segment_len < 2 || offset + segment_len > data.len() {
-            break;
-        }
-
-        // APP1 marker with Exif header?
-        if marker == 0xE1 && segment_len >= 8 {
-            let payload = &data[offset + 2..offset + segment_len];
-            if payload.starts_with(b"Exif\0\0") {
-                return true;
-            }
-        }
-
-        offset += segment_len;
-    }
-
-    false
-}
-
-/// Detect EXIF in PNG by walking chunk structure (length + type pairs).
-/// Avoids false positives from scanning compressed data.
-fn detect_exif_png(data: &[u8]) -> bool {
-    if data.len() < 12 {
-        return false;
-    }
-
-    // Skip PNG signature (8 bytes)
-    let mut offset = 8usize;
-    while offset + 8 <= data.len() {
-        let chunk_len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        let chunk_type = &data[offset + 4..offset + 8];
-
-        if chunk_type == b"eXIf" {
-            return true;
-        }
-
-        // IEND marks end of PNG
-        if chunk_type == b"IEND" {
-            break;
-        }
-
-        // Next chunk: length(4) + type(4) + data(chunk_len) + CRC(4)
-        offset += 12 + chunk_len;
-    }
-
-    false
 }
 
 // ─── Benchmark: Quality Sweep ────────────────────────────────────────────────
@@ -1071,14 +1241,24 @@ pub struct BenchmarkInfo {
 /// and measure size + speed for each. Returns a table that developers
 /// can use to choose the optimal quality for their use case.
 ///
-/// Only meaningful for JPEG (quality affects output size).
-/// For PNG, returns a single entry since quality doesn't apply.
+/// Only meaningful for quality-driven formats (JPEG, lossy WebP, AVIF,
+/// lossy PNG). For lossless output, returns a single entry.
 pub fn benchmark_bytes(
     data: &[u8],
     params: &CompressParams,
 ) -> Result<BenchmarkInfo, CompressError> {
     let format = detect_format(data)?;
     let img = decode_image_with_hint(data, format)?;
+
+    // Match the real compression pipeline: orient, then resize.
+    let img = if params.auto_orient != 0 {
+        match extract_input_orientation(data).filter(|&o| o > 1) {
+            Some(o) => metadata::apply_orientation(img, o),
+            None => img,
+        }
+    } else {
+        img
+    };
 
     // Apply resize constraints so benchmark matches real output
     let img = apply_resize_constraints(&img, params.max_width, params.max_height);
@@ -1087,21 +1267,22 @@ pub fn benchmark_bytes(
 
     let output_format = resolve_output_format(params, format);
 
-    let quality_levels: Vec<u32> = match output_format {
-        DetectedFormat::Jpeg | DetectedFormat::WebpLossy => {
-            vec![95, 90, 85, 80, 75, 70, 60, 50, 40, 30, 20]
-        }
-        // PNG/WebP lossless: quality doesn't apply, just benchmark once
-        _ => vec![0],
+    let quality_levels: Vec<u32> = if supports_quality_search(output_format, params) {
+        vec![95, 90, 85, 80, 75, 70, 60, 50, 40, 30, 20]
+    } else {
+        // Lossless output: quality doesn't apply, just benchmark once
+        vec![0]
     };
 
     // Pre-convert pixels once for the entire sweep (avoids 11× redundant conversions).
     let prepared = prepare_pixels(&img, output_format);
     let mut entries = Vec::with_capacity(quality_levels.len());
+    let meta = MetaPayload::default();
 
     for &q in &quality_levels {
         let start = std::time::Instant::now();
-        let encoded = encode_image_prepared(&prepared, &img, q as u8, output_format, params, None)?;
+        let encoded =
+            encode_image_prepared(&prepared, &img, q as u8, output_format, params, &meta)?;
         let elapsed = start.elapsed().as_millis() as u32;
 
         entries.push(BenchmarkEntry {
@@ -1153,72 +1334,4 @@ pub(crate) fn find_recommended_quality(entries: &[BenchmarkEntry], original_size
     }
 
     best_q
-}
-
-fn resolve_jpeg_exif_payload(
-    input: &[u8],
-    detected: DetectedFormat,
-    output_format: DetectedFormat,
-    params: &CompressParams,
-) -> Result<Option<Vec<u8>>, CompressError> {
-    if params.keep_metadata == 0 {
-        return Ok(None);
-    }
-
-    match (detected, output_format) {
-        (DetectedFormat::Jpeg, DetectedFormat::Jpeg) => Ok(extract_jpeg_exif_payload(input)),
-        // Metadata preservation is only supported for JPEG→JPEG; for all other
-        // format combinations silently skip rather than failing the operation.
-        _ => Ok(None),
-    }
-}
-
-fn extract_jpeg_exif_payload(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-        return None;
-    }
-
-    let mut offset = 2usize;
-    while offset + 4 <= data.len() {
-        if data[offset] != 0xFF {
-            break;
-        }
-
-        let mut marker_offset = offset + 1;
-        while marker_offset < data.len() && data[marker_offset] == 0xFF {
-            marker_offset += 1;
-        }
-        if marker_offset >= data.len() {
-            break;
-        }
-
-        let marker = data[marker_offset];
-        offset = marker_offset + 1;
-
-        if marker == 0xD9 || marker == 0xDA {
-            break;
-        }
-
-        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
-            continue;
-        }
-
-        if offset + 2 > data.len() {
-            break;
-        }
-
-        let segment_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        if segment_len < 2 || offset + segment_len > data.len() {
-            break;
-        }
-
-        let segment = &data[offset + 2..offset + segment_len];
-        if marker == 0xE1 && segment.starts_with(b"Exif\0\0") && segment.len() > 6 {
-            return Some(segment[6..].to_vec());
-        }
-
-        offset += segment_len;
-    }
-
-    None
 }

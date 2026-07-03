@@ -1,6 +1,8 @@
 mod compress;
 mod error;
+mod metadata;
 mod options;
+mod quantize;
 
 #[cfg(test)]
 mod tests;
@@ -47,7 +49,8 @@ fn get_or_build_pool(requested_threads: usize) -> Arc<rayon::ThreadPool> {
 
 /// ABI version — increment when any #[repr(C)] struct layout changes.
 /// Dart checks this on first load and throws on mismatch.
-const ABI_VERSION: u32 = 1;
+/// v2: CompressParams grew png_lossy, auto_orient, preserve_icc, avif_speed.
+const ABI_VERSION: u32 = 2;
 
 /// Maximum allowed input file/buffer size (256 MB).
 const MAX_INPUT_SIZE: usize = 256 * 1024 * 1024;
@@ -373,10 +376,9 @@ pub unsafe extern "C" fn compress_batch(
             inputs_slice
                 .par_iter()
                 .map(|input| {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            process_batch_input(input, params)
-                        }));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process_batch_input(input, params)
+                    }));
 
                     match result {
                         Ok(r) => r,
@@ -602,6 +604,7 @@ fn probe_bytes_impl(data: &[u8]) -> options::ProbeResult {
                 compress::DetectedFormat::Png => 2u32,
                 compress::DetectedFormat::WebpLossless => 3u32,
                 compress::DetectedFormat::WebpLossy => 4u32,
+                compress::DetectedFormat::Avif => 5u32,
             };
             options::ProbeResult::success(
                 info.width,
@@ -709,6 +712,7 @@ fn benchmark_bytes_impl(data: &[u8], params: &options::CompressParams) -> option
                 compress::DetectedFormat::Png => 2u32,
                 compress::DetectedFormat::WebpLossless => 3u32,
                 compress::DetectedFormat::WebpLossy => 4u32,
+                compress::DetectedFormat::Avif => 5u32,
             };
 
             let mut ffi_entries: Vec<options::BenchmarkEntry> = info

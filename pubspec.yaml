@@ -1,9 +1,9 @@
 name: ironpress
 description: >
   High-performance Rust-powered Flutter image compression for JPEG, PNG,
-  and WebP with batch processing, target-size compression, and metadata
-  probing.
-version: 0.2.0
+  WebP, and AVIF with batch processing, target-size compression, and
+  metadata probing.
+version: 0.3.0
 homepage: https://github.com/rickyirfandi/ironpress
 repository: https://github.com/rickyirfandi/ironpress
 issue_tracker: https://github.com/rickyirfandi/ironpress/issues

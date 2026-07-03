@@ -19,13 +19,17 @@
 
 ---
 
-ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwebp, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call; batch work is orchestrated chunk-by-chunk in Dart and each chunk is processed natively, which keeps progress and cancellation deterministic. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
+ironpress compresses JPEG, PNG, WebP, and AVIF images using mozjpeg, oxipng, libwebp, and rav1e, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call; batch work is orchestrated chunk-by-chunk in Dart and each chunk is processed natively, which keeps progress and cancellation deterministic. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
 
 ## Features
 
 - **mozjpeg JPEG compression** with trellis quantization (25-35% smaller than standard encoders)
 - **oxipng PNG optimization**, lossless and multithreaded
 - **WebP lossy and lossless** encoding
+- **AVIF output** via rav1e — typically ~50% smaller than JPEG at equivalent visual quality
+- **Lossy PNG quantization** (up to 256 colors, Floyd–Steinberg dithered) — 60-80% smaller screenshots and UI graphics
+- **EXIF auto-orientation** — pixels are physically rotated to match the orientation tag, so portrait photos never come out sideways
+- **ICC color profile preservation** for JPEG and PNG output — no color shifts on wide-gamut (Display P3) photos
 - **Target file size** in a single FFI call (binary search runs entirely in Rust, zero round-trips)
 - **Parallel batch compression** via Rayon with work-stealing across all cores
 - **Byte-identical output** on Android, iOS, and Windows
@@ -56,7 +60,7 @@ For desktop Flutter apps, the packaged native library is expected to be bundled 
 
 ```yaml
 dependencies:
-  ironpress: ^0.2.0
+  ironpress: ^0.3.0
 ```
 
 ### Basic Usage
@@ -179,9 +183,59 @@ final result = await Ironpress.compressFile(
 );
 ```
 
+### AVIF Output
+
+```dart
+final result = await Ironpress.compressFile(
+  'photo.jpg',
+  quality: 60, // AVIF stays sharp at lower quality than JPEG
+  format: CompressFormat.avif,
+  avif: const AvifOptions(speed: 6), // 1 = smallest/slowest, 10 = fastest
+);
+```
+
+AVIF encoding is significantly slower than JPEG or WebP — use `AvifOptions(speed: 8-10)`
+for interactive flows and lower speeds for background/archival work. AVIF is output-only;
+AVIF files are not accepted as input.
+
+### Lossy PNG
+
+```dart
+final result = await Ironpress.compressFile(
+  'screenshot.png',
+  quality: 80, // controls palette size
+  png: const PngOptions(lossy: true),
+);
+```
+
+Quantizes to a dithered palette of up to 256 colors before oxipng optimization —
+typically 60-80% smaller on screenshots and UI graphics. Photos with fine gradients
+are better served by JPEG, WebP, or AVIF output.
+
+### Orientation & Color Profiles
+
+Both are on by default because they are correctness fixes, not optimizations:
+
+- `autoOrient: true` physically rotates pixels to match the EXIF orientation tag
+  (from JPEG APP1, PNG eXIf, or WebP EXIF chunks). Without it, compressed portrait
+  photos display sideways in anything that ignores the tag. When combined with
+  `keepMetadata: true`, the preserved orientation tag is reset to upright.
+- `keepIccProfile: true` carries the input's ICC color profile (JPEG, PNG, or WebP
+  input) into JPEG and PNG output. Without it, wide-gamut photos (iPhone Display P3)
+  visibly shift color after compression. WebP and AVIF output does not support ICC
+  embedding, so the flag has no effect for those formats.
+
 ### Metadata Handling
 
 `keepMetadata: true` preserves EXIF data for JPEG-to-JPEG output. When converting to PNG or WebP, metadata is silently dropped. The flag is always safe to pass.
+
+### HEIC Input
+
+HEIC/HEIF files (default iPhone camera format) are **not supported** and fail with a
+clear error. Decoding HEVC requires the patent-encumbered libheif C stack, which has no
+pure-Rust implementation and would break ironpress's zero-toolchain prebuilt binaries.
+Request JPEG from your image picker instead — `image_picker` on iOS already transcodes
+HEIC to JPEG by default.
 
 ### Desktop Loading
 
@@ -303,4 +357,4 @@ Contributions are welcome. Please open an issue before submitting a pull request
 
 MIT License — Copyright (c) 2026 [Ricky Irfandi](https://github.com/rickyirfandi). See [LICENSE](LICENSE) for details.
 
-Rust compression engines: [mozjpeg-rs](https://crates.io/crates/mozjpeg-rs) (BSD-3), [oxipng](https://crates.io/crates/oxipng) (MIT).
+Rust compression engines: [mozjpeg-rs](https://crates.io/crates/mozjpeg-rs) (BSD-3), [oxipng](https://crates.io/crates/oxipng) (MIT), [ravif](https://crates.io/crates/ravif) (BSD-3), [color_quant](https://crates.io/crates/color_quant) (MIT).

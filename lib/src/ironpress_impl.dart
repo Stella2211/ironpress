@@ -11,7 +11,8 @@ import 'options.dart';
 
 /// Expected ABI version — must match the Rust constant.
 /// Increment both sides when any #[repr(C)] struct layout changes.
-const int _expectedAbiVersion = 1;
+/// v2: CompressParams grew pngLossy, autoOrient, preserveIcc, avifSpeed.
+const int _expectedAbiVersion = 2;
 
 /// Error code used when the batch progress isolate crashes unexpectedly.
 const int _isolateCrashCode = -100;
@@ -107,6 +108,13 @@ void _validatePngOptions(PngOptions png) {
   }
 }
 
+void _validateAvifOptions(AvifOptions avif) {
+  final speed = avif.speed;
+  if (speed < 1 || speed > 10) {
+    throw ArgumentError.value(speed, 'avif.speed', 'must be in the range 1-10');
+  }
+}
+
 void _validateCompressionArgs({
   int? quality,
   int? maxWidth,
@@ -114,6 +122,7 @@ void _validateCompressionArgs({
   int? maxFileSize,
   int? minQuality,
   required PngOptions png,
+  required AvifOptions avif,
 }) {
   _validateQuality(quality: quality, minQuality: minQuality);
   _validateResizeAndSizeParams(
@@ -122,6 +131,7 @@ void _validateCompressionArgs({
     maxFileSize: maxFileSize,
   );
   _validatePngOptions(png);
+  _validateAvifOptions(avif);
 }
 
 void _validateBatchArgs({required int threadCount, required int chunkSize}) {
@@ -172,8 +182,11 @@ class _BatchIsolateRequest {
     required this.allowResize,
     required this.format,
     required this.keepMetadata,
+    required this.keepIccProfile,
+    required this.autoOrient,
     required this.jpeg,
     required this.png,
+    required this.avif,
     required this.threadCount,
     required this.chunkSize,
     required this.reportProgress,
@@ -190,8 +203,11 @@ class _BatchIsolateRequest {
   final bool allowResize;
   final CompressFormat format;
   final bool keepMetadata;
+  final bool keepIccProfile;
+  final bool autoOrient;
   final JpegOptions jpeg;
   final PngOptions png;
+  final AvifOptions avif;
   final int threadCount;
   final int chunkSize;
   final bool reportProgress;
@@ -212,8 +228,11 @@ Future<void> _batchWorkerMain(_BatchIsolateRequest request) async {
       allowResize: request.allowResize,
       format: request.format,
       keepMetadata: request.keepMetadata,
+      keepIccProfile: request.keepIccProfile,
+      autoOrient: request.autoOrient,
       jpeg: request.jpeg,
       png: request.png,
+      avif: request.avif,
       threadCount: request.threadCount,
       chunkSize: request.chunkSize,
       progressSendPort: request.reportProgress ? request.eventPort : null,
@@ -384,9 +403,21 @@ class Ironpress {
   /// [keepMetadata] — Preserve JPEG EXIF metadata when compressing JPEG to
   /// JPEG. Other paths silently drop metadata.
   ///
+  /// [keepIccProfile] — Preserve the input's ICC color profile in JPEG and
+  /// PNG output (from JPEG, PNG, or WebP input). Prevents color shifts on
+  /// wide-gamut (Display P3) photos. Default: `true`.
+  ///
+  /// [autoOrient] — Physically rotate pixels to match the EXIF orientation
+  /// tag, so photos shot in portrait never come out sideways. When combined
+  /// with [keepMetadata], the preserved EXIF orientation tag is reset to
+  /// upright. Default: `true`.
+  ///
   /// [jpeg] — Advanced JPEG options (progressive, trellis, chroma).
   ///
-  /// [png] — Advanced PNG options (optimization level).
+  /// [png] — Advanced PNG options (optimization level, lossy quantization).
+  ///
+  /// [avif] — Advanced AVIF options (encoder speed). Only used when [format]
+  /// is [CompressFormat.avif].
   ///
   /// Throws [ArgumentError] if [path] is empty.
   /// Throws [CompressException] if the native engine reports an error.
@@ -417,8 +448,11 @@ class Ironpress {
     bool allowResize = true,
     CompressFormat format = CompressFormat.auto,
     bool keepMetadata = false,
+    bool keepIccProfile = true,
+    bool autoOrient = true,
     JpegOptions jpeg = const JpegOptions(),
     PngOptions png = const PngOptions(),
+    AvifOptions avif = const AvifOptions(),
   }) async {
     if (path.isEmpty) {
       throw ArgumentError.value(path, 'path', 'must not be empty');
@@ -430,6 +464,7 @@ class Ironpress {
       maxFileSize: maxFileSize,
       minQuality: minQuality,
       png: png,
+      avif: avif,
     );
     final effectiveQuality = quality ?? preset?.quality ?? 80;
     final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
@@ -446,8 +481,11 @@ class Ironpress {
         allowResize: allowResize,
         format: format,
         keepMetadata: keepMetadata,
+        keepIccProfile: keepIccProfile,
+        autoOrient: autoOrient,
         jpeg: jpeg,
         png: png,
+        avif: avif,
       );
     });
     return result.materialize();
@@ -483,8 +521,11 @@ class Ironpress {
     bool allowResize = true,
     CompressFormat format = CompressFormat.auto,
     bool keepMetadata = false,
+    bool keepIccProfile = true,
+    bool autoOrient = true,
     JpegOptions jpeg = const JpegOptions(),
     PngOptions png = const PngOptions(),
+    AvifOptions avif = const AvifOptions(),
   }) async {
     if (inputPath.isEmpty) {
       throw ArgumentError.value(inputPath, 'inputPath', 'must not be empty');
@@ -499,6 +540,7 @@ class Ironpress {
       maxFileSize: maxFileSize,
       minQuality: minQuality,
       png: png,
+      avif: avif,
     );
     final effectiveQuality = quality ?? preset?.quality ?? 80;
     final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
@@ -516,8 +558,11 @@ class Ironpress {
         allowResize: allowResize,
         format: format,
         keepMetadata: keepMetadata,
+        keepIccProfile: keepIccProfile,
+        autoOrient: autoOrient,
         jpeg: jpeg,
         png: png,
+        avif: avif,
       );
     });
     return result.materialize();
@@ -558,8 +603,11 @@ class Ironpress {
     bool allowResize = true,
     CompressFormat format = CompressFormat.auto,
     bool keepMetadata = false,
+    bool keepIccProfile = true,
+    bool autoOrient = true,
     JpegOptions jpeg = const JpegOptions(),
     PngOptions png = const PngOptions(),
+    AvifOptions avif = const AvifOptions(),
   }) async {
     if (data.isEmpty) {
       throw ArgumentError.value(data, 'data', 'must not be empty');
@@ -571,6 +619,7 @@ class Ironpress {
       maxFileSize: maxFileSize,
       minQuality: minQuality,
       png: png,
+      avif: avif,
     );
     final effectiveQuality = quality ?? preset?.quality ?? 80;
     final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
@@ -588,8 +637,11 @@ class Ironpress {
         allowResize: allowResize,
         format: format,
         keepMetadata: keepMetadata,
+        keepIccProfile: keepIccProfile,
+        autoOrient: autoOrient,
         jpeg: jpeg,
         png: png,
+        avif: avif,
       );
     });
     return result.materialize();
@@ -641,8 +693,11 @@ class Ironpress {
     bool allowResize = true,
     CompressFormat format = CompressFormat.auto,
     bool keepMetadata = false,
+    bool keepIccProfile = true,
+    bool autoOrient = true,
     JpegOptions jpeg = const JpegOptions(),
     PngOptions png = const PngOptions(),
+    AvifOptions avif = const AvifOptions(),
     int threadCount = 0,
     int chunkSize = 8,
     void Function(int completed, int total)? onProgress,
@@ -655,6 +710,7 @@ class Ironpress {
       maxFileSize: maxFileSize,
       minQuality: minQuality,
       png: png,
+      avif: avif,
     );
     _validateBatchArgs(threadCount: threadCount, chunkSize: chunkSize);
     final effectiveQuality = quality ?? preset?.quality ?? 80;
@@ -701,8 +757,11 @@ class Ironpress {
         allowResize: allowResize,
         format: format,
         keepMetadata: keepMetadata,
+        keepIccProfile: keepIccProfile,
+        autoOrient: autoOrient,
         jpeg: jpeg,
         png: png,
+        avif: avif,
         threadCount: threadCount,
         chunkSize: chunkSize,
         onProgress: onProgress,
@@ -723,8 +782,11 @@ class Ironpress {
         allowResize: allowResize,
         format: format,
         keepMetadata: keepMetadata,
+        keepIccProfile: keepIccProfile,
+        autoOrient: autoOrient,
         jpeg: jpeg,
         png: png,
+        avif: avif,
         threadCount: threadCount,
         chunkSize: chunkSize,
       );
@@ -764,8 +826,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
     required int threadCount,
     required int chunkSize,
     void Function(int completed, int total)? onProgress,
@@ -858,8 +923,11 @@ class Ironpress {
           allowResize: allowResize,
           format: format,
           keepMetadata: keepMetadata,
+          keepIccProfile: keepIccProfile,
+          autoOrient: autoOrient,
           jpeg: jpeg,
           png: png,
+          avif: avif,
           threadCount: threadCount,
           chunkSize: chunkSize,
           reportProgress: onProgress != null,
@@ -1011,8 +1079,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
   }) {
     final bindings = Ironpress._b;
     final pathPtr = path.toNativeUtf8();
@@ -1025,8 +1096,11 @@ class Ironpress {
       allowResize: allowResize,
       format: format,
       keepMetadata: keepMetadata,
+      keepIccProfile: keepIccProfile,
+      autoOrient: autoOrient,
       jpeg: jpeg,
       png: png,
+      avif: avif,
     );
     final outPtr = malloc<NativeCompressResult>();
 
@@ -1050,8 +1124,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
   }) {
     final bindings = Ironpress._b;
     final inputPtr = inputPath.toNativeUtf8();
@@ -1065,8 +1142,11 @@ class Ironpress {
       allowResize: allowResize,
       format: format,
       keepMetadata: keepMetadata,
+      keepIccProfile: keepIccProfile,
+      autoOrient: autoOrient,
       jpeg: jpeg,
       png: png,
+      avif: avif,
     );
     final outPtr = malloc<NativeCompressResult>();
 
@@ -1090,8 +1170,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
   }) {
     final bindings = Ironpress._b;
     final nativeData = _copyBytesToNative(data);
@@ -1104,8 +1187,11 @@ class Ironpress {
       allowResize: allowResize,
       format: format,
       keepMetadata: keepMetadata,
+      keepIccProfile: keepIccProfile,
+      autoOrient: autoOrient,
       jpeg: jpeg,
       png: png,
+      avif: avif,
     );
     final outPtr = malloc<NativeCompressResult>();
 
@@ -1159,8 +1245,11 @@ class Ironpress {
       maxHeight: maxHeight,
       format: CompressFormat.auto,
       keepMetadata: false,
+      keepIccProfile: true,
+      autoOrient: true,
       jpeg: const JpegOptions(),
       png: const PngOptions(),
+      avif: const AvifOptions(),
       minQuality: 30,
       allowResize: true,
     );
@@ -1188,8 +1277,11 @@ class Ironpress {
       maxHeight: maxHeight,
       format: CompressFormat.auto,
       keepMetadata: false,
+      keepIccProfile: true,
+      autoOrient: true,
       jpeg: const JpegOptions(),
       png: const PngOptions(),
+      avif: const AvifOptions(),
       minQuality: 30,
       allowResize: true,
     );
@@ -1215,8 +1307,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
   }) {
     final p = calloc<NativeCompressParams>();
     p.ref.quality = quality.clamp(0, 100);
@@ -1231,6 +1326,10 @@ class Ironpress {
     p.ref.jpegChromaSubsampling = jpeg.chromaSubsampling.value;
     p.ref.jpegTrellis = jpeg.trellis ? 1 : 0;
     p.ref.pngOptimizationLevel = png.optimizationLevel.clamp(0, 6);
+    p.ref.pngLossy = png.lossy ? 1 : 0;
+    p.ref.autoOrient = autoOrient ? 1 : 0;
+    p.ref.preserveIcc = keepIccProfile ? 1 : 0;
+    p.ref.avifSpeed = avif.speed.clamp(1, 10);
     return p;
   }
 
@@ -1353,8 +1452,11 @@ class Ironpress {
     required bool allowResize,
     required CompressFormat format,
     required bool keepMetadata,
+    required bool keepIccProfile,
+    required bool autoOrient,
     required JpegOptions jpeg,
     required PngOptions png,
+    required AvifOptions avif,
     required int threadCount,
     required int chunkSize,
     SendPort? progressSendPort,
@@ -1371,8 +1473,11 @@ class Ironpress {
       allowResize: allowResize,
       format: format,
       keepMetadata: keepMetadata,
+      keepIccProfile: keepIccProfile,
+      autoOrient: autoOrient,
       jpeg: jpeg,
       png: png,
+      avif: avif,
     );
 
     final allResults = <_TransferableCompressResult>[];
