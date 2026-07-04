@@ -156,8 +156,7 @@ fn input_format_hint(data: &[u8]) -> Option<ImageFormat> {
         return Some(ImageFormat::Jpeg);
     }
 
-    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47
-    {
+    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
         return Some(ImageFormat::Png);
     }
 
@@ -879,7 +878,7 @@ fn encode_webp_lossless_rgba_raw(
     Ok(buf)
 }
 
-/// Encode image as lossy WebP using the `webp` crate.
+/// Encode image as lossy WebP using the `webpx` crate (libwebp bindings).
 /// Uses RGB path when possible to avoid unnecessary RGBA conversion.
 fn encode_webp_lossy(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, CompressError> {
     match img {
@@ -893,15 +892,25 @@ fn encode_webp_lossy(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, Compres
     }
 }
 
+/// Map a `webpx` encode error to our error type. `webpx::Result` wraps the
+/// error in `At<Error>` for source-location tracing; we only need the plain,
+/// `Display`-able `webpx::Error`, obtained via the non-consuming `error()`
+/// accessor (`into_inner()` is deprecated).
+fn map_webpx_error(err: webpx::Result<Vec<u8>>) -> Result<Vec<u8>, CompressError> {
+    err.map_err(|e| CompressError::EncodeError(format!("WebP encode failed: {}", e.error())))
+}
+
 fn encode_webp_lossy_rgb_raw(
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: u8,
 ) -> Result<Vec<u8>, CompressError> {
-    let encoder = webp::Encoder::from_rgb(pixels, width, height);
-    let mem = encoder.encode(quality as f32);
-    Ok(mem.to_vec())
+    map_webpx_error(
+        webpx::Encoder::new_rgb(pixels, width, height)
+            .quality(quality as f32)
+            .encode(webpx::Unstoppable),
+    )
 }
 
 fn encode_webp_lossy_rgba_raw(
@@ -910,9 +919,11 @@ fn encode_webp_lossy_rgba_raw(
     height: u32,
     quality: u8,
 ) -> Result<Vec<u8>, CompressError> {
-    let encoder = webp::Encoder::from_rgba(pixels, width, height);
-    let mem = encoder.encode(quality as f32);
-    Ok(mem.to_vec())
+    map_webpx_error(
+        webpx::Encoder::new_rgba(pixels, width, height)
+            .quality(quality as f32)
+            .encode(webpx::Unstoppable),
+    )
 }
 
 // ─── Probe: Quick Metadata Without Full Decode ───────────────────────────────

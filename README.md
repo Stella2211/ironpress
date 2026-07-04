@@ -19,6 +19,12 @@
 
 ---
 
+> **This is a fork** of [rickyirfandi/ironpress](https://github.com/rickyirfandi/ironpress), maintained for use by [Constellation](https://github.com/Stella2211/constellation). Changes from upstream:
+>
+> - Fixed a launch-blocking bug where the prebuilt macOS dylib kept the CI build machine's absolute `install_name` instead of `@rpath/libironpress.dylib`.
+> - Migrated the lossy WebP encoder from the unmaintained `webp` crate (libwebp 1.3.1) to `webpx` (libwebp 1.6.x).
+> - Added an install_name normalization step to the CI build workflow so future prebuilt macOS binaries stay relocatable.
+
 ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwebp, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call; batch work is orchestrated chunk-by-chunk in Dart and each chunk is processed natively, which keeps progress and cancellation deterministic. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
 
 ## Features
