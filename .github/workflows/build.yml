@@ -255,6 +255,11 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
+      # Keep rust/Cargo.lock consistent with rust/Cargo.toml so the committed
+      # lockfile records the dependency versions the binaries were built from.
+      - name: Regenerate Cargo.lock
+        run: cargo generate-lockfile --manifest-path rust/Cargo.toml
+
       # Commit locally BEFORE validation: `flutter pub publish --dry-run`
       # exits 65 when checked-in files are dirty, so the tree must be clean
       # at validation time. The push happens only after validation passes.
@@ -265,6 +270,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add -f \
+            rust/Cargo.lock \
             android/src/main/jniLibs/ \
             windows/libs/ \
             linux/libs/ \
