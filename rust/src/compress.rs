@@ -878,7 +878,7 @@ fn encode_webp_lossless_rgba_raw(
     Ok(buf)
 }
 
-/// Encode image as lossy WebP using the `webp` crate.
+/// Encode image as lossy WebP using the `webpx` crate (libwebp bindings).
 /// Uses RGB path when possible to avoid unnecessary RGBA conversion.
 fn encode_webp_lossy(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, CompressError> {
     match img {
@@ -892,15 +892,23 @@ fn encode_webp_lossy(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, Compres
     }
 }
 
+/// Map a `webpx` encode error to our error type, discarding the source-location
+/// trace (`At<Error>`) and keeping the plain, `Display`-able `webpx::Error`.
+fn map_webpx_error(err: webpx::Result<Vec<u8>>) -> Result<Vec<u8>, CompressError> {
+    err.map_err(|e| CompressError::EncodeError(format!("WebP encode failed: {}", e.into_inner())))
+}
+
 fn encode_webp_lossy_rgb_raw(
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: u8,
 ) -> Result<Vec<u8>, CompressError> {
-    let encoder = webp::Encoder::from_rgb(pixels, width, height);
-    let mem = encoder.encode(quality as f32);
-    Ok(mem.to_vec())
+    map_webpx_error(
+        webpx::Encoder::new_rgb(pixels, width, height)
+            .quality(quality as f32)
+            .encode(webpx::Unstoppable),
+    )
 }
 
 fn encode_webp_lossy_rgba_raw(
@@ -909,9 +917,11 @@ fn encode_webp_lossy_rgba_raw(
     height: u32,
     quality: u8,
 ) -> Result<Vec<u8>, CompressError> {
-    let encoder = webp::Encoder::from_rgba(pixels, width, height);
-    let mem = encoder.encode(quality as f32);
-    Ok(mem.to_vec())
+    map_webpx_error(
+        webpx::Encoder::new_rgba(pixels, width, height)
+            .quality(quality as f32)
+            .encode(webpx::Unstoppable),
+    )
 }
 
 // ─── Probe: Quick Metadata Without Full Decode ───────────────────────────────

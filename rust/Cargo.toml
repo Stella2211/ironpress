@@ -14,7 +14,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 zune-jpeg = "0.5"
 mozjpeg-rs = "0.5"
 oxipng = { version = "9", default-features = false, features = ["parallel"] }
-webp = "0.3"
+webpx = "0.4"
 rayon = "1.10"
 libc = "0.2"
 fast_image_resize = "5"
