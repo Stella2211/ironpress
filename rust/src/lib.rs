@@ -373,10 +373,9 @@ pub unsafe extern "C" fn compress_batch(
             inputs_slice
                 .par_iter()
                 .map(|input| {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            process_batch_input(input, params)
-                        }));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process_batch_input(input, params)
+                    }));
 
                     match result {
                         Ok(r) => r,

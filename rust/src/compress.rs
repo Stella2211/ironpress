@@ -156,8 +156,7 @@ fn input_format_hint(data: &[u8]) -> Option<ImageFormat> {
         return Some(ImageFormat::Jpeg);
     }
 
-    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47
-    {
+    if data.len() >= 4 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
         return Some(ImageFormat::Png);
     }
 
