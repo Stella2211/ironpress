@@ -892,10 +892,12 @@ fn encode_webp_lossy(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, Compres
     }
 }
 
-/// Map a `webpx` encode error to our error type, discarding the source-location
-/// trace (`At<Error>`) and keeping the plain, `Display`-able `webpx::Error`.
+/// Map a `webpx` encode error to our error type. `webpx::Result` wraps the
+/// error in `At<Error>` for source-location tracing; we only need the plain,
+/// `Display`-able `webpx::Error`, obtained via the non-consuming `error()`
+/// accessor (`into_inner()` is deprecated).
 fn map_webpx_error(err: webpx::Result<Vec<u8>>) -> Result<Vec<u8>, CompressError> {
-    err.map_err(|e| CompressError::EncodeError(format!("WebP encode failed: {}", e.into_inner())))
+    err.map_err(|e| CompressError::EncodeError(format!("WebP encode failed: {}", e.error())))
 }
 
 fn encode_webp_lossy_rgb_raw(
