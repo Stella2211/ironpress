@@ -110,6 +110,17 @@ jobs:
             target/x86_64-apple-darwin/release/libironpress.dylib \
             -output target/release/libironpress.dylib
 
+      - name: Fix install name and re-sign
+        working-directory: rust
+        run: |
+          # Prebuilt binaries are committed to the repo and consumed from an
+          # arbitrary checkout path, so the id must not point at the CI
+          # runner's build path. @rpath lets the linking app's rpath
+          # (e.g. @executable_path/../Frameworks) resolve it at runtime.
+          install_name_tool -id @rpath/libironpress.dylib target/release/libironpress.dylib
+          codesign -f -s - target/release/libironpress.dylib
+          otool -D target/release/libironpress.dylib
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
