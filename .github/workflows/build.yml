@@ -255,16 +255,11 @@ jobs:
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
-      - name: Validate package
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/linux/libs
-        run: |
-          flutter pub get
-          flutter analyze
-          flutter test
-          flutter pub publish --dry-run
-
-      - name: Commit precompiled binaries
+      # Commit locally BEFORE validation: `flutter pub publish --dry-run`
+      # exits 65 when checked-in files are dirty, so the tree must be clean
+      # at validation time. The push happens only after validation passes.
+      - name: Commit precompiled binaries (local)
+        id: commit_binaries
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -279,6 +274,7 @@ jobs:
           # Only commit if there are changes
           if git diff --cached --quiet; then
             echo "No changes to commit — binaries are up to date."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else
             git commit -m "chore: update precompiled native binaries
 
@@ -286,9 +282,23 @@ jobs:
           Platforms: Android (arm64-v8a, armeabi-v7a, x86_64, x86),
           Windows (x64), Linux (x64), macOS (universal), iOS (xcframework)"
 
-            git push origin HEAD:${{ github.event.repository.default_branch }}
-            echo "Precompiled binaries committed and pushed."
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Validate package
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/linux/libs
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+          flutter pub publish --dry-run
+
+      - name: Push precompiled binaries
+        if: steps.commit_binaries.outputs.has_changes == 'true'
+        run: |
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+          echo "Precompiled binaries committed and pushed."
 
       - name: Upload packaged plugin
         uses: actions/upload-artifact@v4
