@@ -149,15 +149,20 @@ jobs:
       - name: Create xcframework
         working-directory: rust
         run: |
-          # Simulator fat library
+          # Simulator fat library. CocoaPods' xcframework validator rejects
+          # slices whose binary basenames differ (it looks for a single
+          # consistent library name across all AvailableLibraries entries),
+          # so keep the simulator slice's file named identically to the
+          # device slice by placing it in its own directory.
+          mkdir -p target/ios-sim-fat
           lipo -create \
             target/aarch64-apple-ios-sim/release/libironpress.a \
             target/x86_64-apple-ios/release/libironpress.a \
-            -output target/release/libironpress-sim.a
+            -output target/ios-sim-fat/libironpress.a
 
           xcodebuild -create-xcframework \
             -library target/aarch64-apple-ios/release/libironpress.a \
-            -library target/release/libironpress-sim.a \
+            -library target/ios-sim-fat/libironpress.a \
             -output target/release/ironpress.xcframework
 
       - name: Upload artifact
