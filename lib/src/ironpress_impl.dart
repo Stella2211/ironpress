@@ -902,10 +902,6 @@ class Ironpress {
     return Isolate.run(() => _probeFileSync(path));
   }
 
-  /// Deprecated. Use [probeFile] instead.
-  @Deprecated('Use probeFile instead')
-  static Future<ImageProbe> probe(String path) => probeFile(path);
-
   /// Read image metadata from bytes without decoding pixel data.
   ///
   /// Throws [ArgumentError] if [data] is empty.
@@ -955,14 +951,6 @@ class Ironpress {
       () => _benchmarkFileSync(path, maxWidth: maxWidth, maxHeight: maxHeight),
     );
   }
-
-  /// Deprecated. Use [benchmarkFile] instead.
-  @Deprecated('Use benchmarkFile instead')
-  static Future<BenchmarkResult> benchmark(
-    String path, {
-    int? maxWidth,
-    int? maxHeight,
-  }) => benchmarkFile(path, maxWidth: maxWidth, maxHeight: maxHeight);
 
   /// Run a quality sweep on raw image bytes.
   ///
