@@ -47,7 +47,7 @@ jobs:
         run: flutter test test/ironpress_test.dart test/options_test.dart
 
       - name: Run integration tests (with native library)
-        run: flutter test test/integration_test.dart
+        run: flutter test --dart-define=IRONPRESS_NATIVE_REQUIRED=true test/integration_test.dart
         env:
           # Make the compiled .so discoverable by DynamicLibrary.open()
           LD_LIBRARY_PATH: ${{ github.workspace }}/rust/target/release
@@ -101,7 +101,7 @@ jobs:
         run: flutter pub get
 
       - name: Smoke test bundled Windows library
-        run: flutter test test/integration_test.dart --plain-name "produces non-empty output with valid stats"
+        run: flutter test --dart-define=IRONPRESS_NATIVE_REQUIRED=true test/integration_test.dart --plain-name "produces non-empty output with valid stats"
 
   macos-desktop-smoke:
     name: Desktop smoke (macOS)
@@ -118,7 +118,7 @@ jobs:
         run: flutter pub get
 
       - name: Smoke test bundled macOS library
-        run: flutter test test/integration_test.dart --plain-name "produces non-empty output with valid stats"
+        run: flutter test --dart-define=IRONPRESS_NATIVE_REQUIRED=true test/integration_test.dart --plain-name "produces non-empty output with valid stats"
 
   publish-check:
     name: pub publish --dry-run

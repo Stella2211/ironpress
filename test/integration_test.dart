@@ -398,12 +398,28 @@ Uint8List _jpegWithExif() {
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
+const bool _nativeRequired = bool.fromEnvironment('IRONPRESS_NATIVE_REQUIRED');
+
+bool _isNativeLibraryUnavailable(StateError error) {
+  return error.toString().contains(
+    'ironpress: failed to load the native library',
+  );
+}
+
+void _skipIfNativeLibraryUnavailable(StateError error, StackTrace stackTrace) {
+  if (_nativeRequired || !_isNativeLibraryUnavailable(error)) {
+    Error.throwWithStackTrace(error, stackTrace);
+  }
+  markTestSkipped('Native library not available: $error');
+}
+
 /// Returns true if the native library loaded successfully.
 bool _nativeLibraryAvailable() {
   try {
     Ironpress.nativeVersion;
     return true;
-  } catch (_) {
+  } on StateError catch (error, stackTrace) {
+    _skipIfNativeLibraryUnavailable(error, stackTrace);
     return false;
   }
 }
@@ -413,8 +429,8 @@ bool _nativeLibraryAvailable() {
 Future<T?> _runWithNative<T>(Future<T> Function() action) async {
   try {
     return await action();
-  } on StateError catch (error) {
-    markTestSkipped('Native library not available: $error');
+  } on StateError catch (error, stackTrace) {
+    _skipIfNativeLibraryUnavailable(error, stackTrace);
     return null;
   }
 }
@@ -425,11 +441,11 @@ void main() {
       CompressResult result;
       try {
         result = await Ironpress.compressBytes(_syntheticJpeg(), quality: 80);
-      } on StateError catch (e) {
+      } on StateError catch (error, stackTrace) {
         // Native library not built for this environment — skip.
         // To run: cd rust && cargo build --release
         //         LD_LIBRARY_PATH=rust/target/release flutter test
-        markTestSkipped('Native library not available: $e');
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -445,8 +461,8 @@ void main() {
       CompressResult result;
       try {
         result = await Ironpress.compressBytes(_syntheticJpeg(), quality: 80);
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -462,8 +478,8 @@ void main() {
           quality: 80,
           format: CompressFormat.jpeg,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -482,8 +498,8 @@ void main() {
           _syntheticPng(),
           format: CompressFormat.png,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -508,8 +524,8 @@ void main() {
           quality: 80,
           format: CompressFormat.webpLossy,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -530,8 +546,8 @@ void main() {
           _syntheticJpeg(),
           format: CompressFormat.png,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -549,8 +565,8 @@ void main() {
           _syntheticJpeg(),
           maxFileSize: targetBytes,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -564,8 +580,8 @@ void main() {
       ImageProbe probe;
       try {
         probe = await Ironpress.probeBytes(_syntheticJpeg());
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -578,8 +594,8 @@ void main() {
       ImageProbe probe;
       try {
         probe = await Ironpress.probeBytes(_syntheticPng());
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -607,8 +623,8 @@ void main() {
       CompressResult result;
       try {
         result = await Ironpress.compressFile(inputFile.path, quality: 80);
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -629,8 +645,8 @@ void main() {
           outputPath,
           quality: 80,
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -654,8 +670,8 @@ void main() {
       BatchCompressResult batch;
       try {
         batch = await Ironpress.compressBatch(inputs, quality: 80);
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -684,8 +700,8 @@ void main() {
             progressUpdates.add(completed);
           },
         );
-      } on StateError catch (_) {
-        markTestSkipped('Native library not available');
+      } on StateError catch (error, stackTrace) {
+        _skipIfNativeLibraryUnavailable(error, stackTrace);
         return;
       }
 
@@ -696,6 +712,16 @@ void main() {
   });
 
   group('Integration — native version', () {
+    test('ABI mismatch is not treated as an unavailable library', () {
+      expect(
+        () => _skipIfNativeLibraryUnavailable(
+          StateError('Ironpress ABI version mismatch: native=0, expected=1.'),
+          StackTrace.current,
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
     group('Integration - batch contracts', () {
       test(
         'progress is monotonic and final completion is emitted once',
@@ -769,8 +795,8 @@ void main() {
           BatchCompressResult batch;
           try {
             batch = await future;
-          } on StateError catch (error) {
-            markTestSkipped('Native library not available: $error');
+          } on StateError catch (error, stackTrace) {
+            _skipIfNativeLibraryUnavailable(error, stackTrace);
             return;
           }
 
@@ -915,7 +941,6 @@ void main() {
 
     test('nativeVersion matches the packaged native release', () {
       if (!_nativeLibraryAvailable()) {
-        markTestSkipped('Native library not available');
         return;
       }
 
