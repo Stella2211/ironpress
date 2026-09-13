@@ -150,8 +150,9 @@ class _WorkerFailure {
     if (code != null) {
       return CompressException(code!, message);
     }
-    final suffix =
-        stackTrace == null || stackTrace!.isEmpty ? '' : '\n$stackTrace';
+    final suffix = stackTrace == null || stackTrace!.isEmpty
+        ? ''
+        : '\n$stackTrace';
     return StateError('$message$suffix');
   }
 
@@ -680,10 +681,9 @@ class Ironpress {
         .map(
           (input) => _TransferableBatchInputSpec(
             path: input.path,
-            data:
-                input.data == null
-                    ? null
-                    : TransferableTypedData.fromList([input.data!]),
+            data: input.data == null
+                ? null
+                : TransferableTypedData.fromList([input.data!]),
             outputPath: input.outputPath,
           ),
         )
@@ -833,10 +833,9 @@ class Ironpress {
       });
 
       errorSubscription = errorPort.listen((message) {
-        final details =
-            message is List && message.isNotEmpty
-                ? message.first.toString()
-                : 'unknown isolate error';
+        final details = message is List && message.isNotEmpty
+            ? message.first.toString()
+            : 'unknown isolate error';
         completeError(
           CompressException(
             _isolateCrashCode,
@@ -1242,10 +1241,9 @@ class Ironpress {
       final ref = outPtr.ref;
 
       if (ref.errorCode != 0) {
-        final msg =
-            ref.errorMessage != nullptr
-                ? ref.errorMessage.toDartString()
-                : 'Unknown error (code ${ref.errorCode})';
+        final msg = ref.errorMessage != nullptr
+            ? ref.errorMessage.toDartString()
+            : 'Unknown error (code ${ref.errorCode})';
         throw CompressException(ref.errorCode, msg);
       }
 
@@ -1280,10 +1278,9 @@ class Ironpress {
       final ref = outPtr.ref;
 
       if (ref.errorCode != 0) {
-        final msg =
-            ref.errorMessage != nullptr
-                ? ref.errorMessage.toDartString()
-                : 'Probe failed (code ${ref.errorCode})';
+        final msg = ref.errorMessage != nullptr
+            ? ref.errorMessage.toDartString()
+            : 'Probe failed (code ${ref.errorCode})';
         throw CompressException(ref.errorCode, msg);
       }
 
@@ -1309,10 +1306,9 @@ class Ironpress {
       final ref = outPtr.ref;
 
       if (ref.errorCode != 0) {
-        final msg =
-            ref.errorMessage != nullptr
-                ? ref.errorMessage.toDartString()
-                : 'Benchmark failed (code ${ref.errorCode})';
+        final msg = ref.errorMessage != nullptr
+            ? ref.errorMessage.toDartString()
+            : 'Benchmark failed (code ${ref.errorCode})';
         throw CompressException(ref.errorCode, msg);
       }
 
@@ -1490,10 +1486,9 @@ class Ironpress {
         for (var i = 0; i < batchRef.count; i++) {
           final native = batchRef.results[i];
           if (native.errorCode != 0) {
-            final msg =
-                native.errorMessage != nullptr
-                    ? native.errorMessage.toDartString()
-                    : 'Error (code ${native.errorCode})';
+            final msg = native.errorMessage != nullptr
+                ? native.errorMessage.toDartString()
+                : 'Error (code ${native.errorCode})';
             results.add(
               _TransferableCompressResult(
                 originalSize: native.originalSize,

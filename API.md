@@ -351,7 +351,7 @@ static String get nativeVersion
 **Example:**
 
 ```dart
-print(Ironpress.nativeVersion); // "0.1.0"
+print(Ironpress.nativeVersion); // "0.3.0"
 ```
 
 ---

@@ -362,10 +362,9 @@ class BatchCompressResult {
       elapsedMs > 0 ? results.length / (elapsedMs / 1000.0) : 0;
 
   /// Throughput in MB/s of input data processed.
-  double get mbPerSecond =>
-      elapsedMs > 0
-          ? (totalOriginalSize / (1024 * 1024)) / (elapsedMs / 1000.0)
-          : 0;
+  double get mbPerSecond => elapsedMs > 0
+      ? (totalOriginalSize / (1024 * 1024)) / (elapsedMs / 1000.0)
+      : 0;
 
   @override
   String toString() =>
@@ -527,8 +526,9 @@ class BenchmarkResult {
       'recommended: q$recommendedQuality)',
     );
     for (final entry in entries) {
-      final marker =
-          entry.quality == recommendedQuality ? '  ← recommended' : '';
+      final marker = entry.quality == recommendedQuality
+          ? '  ← recommended'
+          : '';
       buf.writeln('  $entry$marker');
     }
     return buf.toString().trimRight();

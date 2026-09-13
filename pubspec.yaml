@@ -3,7 +3,7 @@ description: >
   High-performance Rust-powered Flutter image compression for JPEG, PNG,
   and WebP with batch processing, target-size compression, and metadata
   probing.
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/rickyirfandi/ironpress
 repository: https://github.com/rickyirfandi/ironpress
 issue_tracker: https://github.com/rickyirfandi/ironpress/issues
@@ -15,8 +15,8 @@ topics:
   - webp
 
 environment:
-  sdk: ^3.7.0
-  flutter: ">=3.29.0"
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
 
 dependencies:
   ffi: ^2.2.0
@@ -26,7 +26,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^5.0.0
+  flutter_lints: ^6.0.0
 
 # Platform support is gated by precompiled native binaries.
 # Only platforms with binaries in the package will work.

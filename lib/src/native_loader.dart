@@ -14,8 +14,7 @@ DynamicLibrary loadNativeLibrary() {
       platform: 'Android',
       packagedHint:
           'Ensure the packaged Android `jniLibs` include `libironpress.so`.',
-      devHint:
-          'If you are modifying the native code, rebuild the Android library and package it into the app before running.',
+      devHint: 'If you are modifying the native code, rebuild the Android library and package it into the app before running.',
     );
   }
 
@@ -31,10 +30,8 @@ DynamicLibrary loadNativeLibrary() {
         'libironpress.dylib',
       ]),
       platform: 'macOS',
-      packagedHint:
-          'In a packaged Flutter macOS app, `libironpress.dylib` should be bundled automatically.',
-      devHint:
-          'When running directly from this package checkout, ensure the repo `macos/libs` directory is available from the current working directory or `DYLD_LIBRARY_PATH`.',
+      packagedHint: 'In a packaged Flutter macOS app, `libironpress.dylib` should be bundled automatically.',
+      devHint: 'When running directly from this package checkout, ensure the repo `macos/libs` directory is available from the current working directory or `DYLD_LIBRARY_PATH`.',
     );
   }
 
@@ -46,10 +43,8 @@ DynamicLibrary loadNativeLibrary() {
         'libironpress.so',
       ]),
       platform: 'Linux',
-      packagedHint:
-          'In a packaged Flutter Linux app, `libironpress.so` should be bundled automatically.',
-      devHint:
-          'When running directly from this package checkout, ensure the repo `linux/libs` directory is reachable from the current working directory or `LD_LIBRARY_PATH`.',
+      packagedHint: 'In a packaged Flutter Linux app, `libironpress.so` should be bundled automatically.',
+      devHint: 'When running directly from this package checkout, ensure the repo `linux/libs` directory is reachable from the current working directory or `LD_LIBRARY_PATH`.',
     );
   }
 
@@ -61,10 +56,8 @@ DynamicLibrary loadNativeLibrary() {
         '$_libName.dll',
       ]),
       platform: 'Windows',
-      packagedHint:
-          'In a packaged Flutter Windows app, `ironpress.dll` should be bundled automatically.',
-      devHint:
-          'When running directly from this package checkout, ensure the repo `windows/libs` directory is reachable from the current working directory or `PATH`.',
+      packagedHint: 'In a packaged Flutter Windows app, `ironpress.dll` should be bundled automatically.',
+      devHint: 'When running directly from this package checkout, ensure the repo `windows/libs` directory is reachable from the current working directory or `PATH`.',
     );
   }
 

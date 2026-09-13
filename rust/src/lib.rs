@@ -54,7 +54,7 @@ const MAX_INPUT_SIZE: usize = 256 * 1024 * 1024;
 
 /// Return the ABI version of this native library.
 /// Dart checks this on first load to detect stale binaries.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironpress_abi_version() -> u32 {
     ABI_VERSION
 }
@@ -68,68 +68,70 @@ pub extern "C" fn ironpress_abi_version() -> u32 {
 /// - `params` must point to a valid CompressParams.
 /// - `out` must point to a valid, writable CompressResult.
 /// - Caller must free the result with `free_compress_result`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress_file(
     input_path: *const libc::c_char,
     params: *const CompressParams,
     out: *mut CompressResult,
 ) {
-    if out.is_null() {
-        return;
-    }
-
-    if input_path.is_null() || params.is_null() {
-        *out = CompressResult::error(-1, "Null pointer argument");
-        return;
-    }
-
-    let path = match CStr::from_ptr(input_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            *out = CompressResult::error(-2, "Invalid UTF-8 in path");
+    unsafe {
+        if out.is_null() {
             return;
         }
-    };
 
-    let params = &*params;
-
-    let input_data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(e) => {
-            *out = CompressResult::error(-3, &format!("Failed to read file: {e}"));
+        if input_path.is_null() || params.is_null() {
+            *out = CompressResult::error(-1, "Null pointer argument");
             return;
         }
-    };
 
-    if input_data.len() > MAX_INPUT_SIZE {
-        *out = CompressResult::error(
-            -5,
-            &format!(
-                "Input file too large ({} bytes, max {})",
-                input_data.len(),
-                MAX_INPUT_SIZE
+        let path = match CStr::from_ptr(input_path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out = CompressResult::error(-2, "Invalid UTF-8 in path");
+                return;
+            }
+        };
+
+        let params = &*params;
+
+        let input_data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(e) => {
+                *out = CompressResult::error(-3, &format!("Failed to read file: {e}"));
+                return;
+            }
+        };
+
+        if input_data.len() > MAX_INPUT_SIZE {
+            *out = CompressResult::error(
+                -5,
+                &format!(
+                    "Input file too large ({} bytes, max {})",
+                    input_data.len(),
+                    MAX_INPUT_SIZE
+                ),
+            );
+            return;
+        }
+
+        let original_size = input_data.len();
+
+        *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compress::compress_bytes(&input_data, params)
+        })) {
+            Ok(Ok(result)) => CompressResult::success(
+                result.data,
+                original_size,
+                result.width,
+                result.height,
+                result.quality_used,
+                result.iterations,
+                result.resized_to_fit,
             ),
-        );
-        return;
+            Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
+            Err(_) => CompressResult::error(-99, "Internal panic during compression"),
+        };
     }
-
-    let original_size = input_data.len();
-
-    *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compress::compress_bytes(&input_data, params)
-    })) {
-        Ok(Ok(result)) => CompressResult::success(
-            result.data,
-            original_size,
-            result.width,
-            result.height,
-            result.quality_used,
-            result.iterations,
-            result.resized_to_fit,
-        ),
-        Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
-        Err(_) => CompressResult::error(-99, "Internal panic during compression"),
-    };
 }
 
 // ─── FFI: Compress from memory buffer ────────────────────────────────────────
@@ -140,53 +142,55 @@ pub unsafe extern "C" fn compress_file(
 /// - `input_data` must point to a valid buffer of `input_len` bytes.
 /// - `out` must point to a valid, writable CompressResult.
 /// - Caller must free the result with `free_compress_result`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress_buffer(
     input_data: *const u8,
     input_len: usize,
     params: *const CompressParams,
     out: *mut CompressResult,
 ) {
-    if out.is_null() {
-        return;
+    unsafe {
+        if out.is_null() {
+            return;
+        }
+
+        if input_data.is_null() || params.is_null() {
+            *out = CompressResult::error(-1, "Null pointer argument");
+            return;
+        }
+
+        if input_len == 0 {
+            *out = CompressResult::error(-2, "Empty input buffer");
+            return;
+        }
+
+        if input_len > MAX_INPUT_SIZE {
+            *out = CompressResult::error(
+                -5,
+                &format!("Input buffer too large ({input_len} bytes, max {MAX_INPUT_SIZE})"),
+            );
+            return;
+        }
+
+        let data = slice::from_raw_parts(input_data, input_len);
+        let params = &*params;
+
+        *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compress::compress_bytes(data, params)
+        })) {
+            Ok(Ok(result)) => CompressResult::success(
+                result.data,
+                input_len,
+                result.width,
+                result.height,
+                result.quality_used,
+                result.iterations,
+                result.resized_to_fit,
+            ),
+            Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
+            Err(_) => CompressResult::error(-99, "Internal panic during compression"),
+        };
     }
-
-    if input_data.is_null() || params.is_null() {
-        *out = CompressResult::error(-1, "Null pointer argument");
-        return;
-    }
-
-    if input_len == 0 {
-        *out = CompressResult::error(-2, "Empty input buffer");
-        return;
-    }
-
-    if input_len > MAX_INPUT_SIZE {
-        *out = CompressResult::error(
-            -5,
-            &format!("Input buffer too large ({input_len} bytes, max {MAX_INPUT_SIZE})"),
-        );
-        return;
-    }
-
-    let data = slice::from_raw_parts(input_data, input_len);
-    let params = &*params;
-
-    *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compress::compress_bytes(data, params)
-    })) {
-        Ok(Ok(result)) => CompressResult::success(
-            result.data,
-            input_len,
-            result.width,
-            result.height,
-            result.quality_used,
-            result.iterations,
-            result.resized_to_fit,
-        ),
-        Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
-        Err(_) => CompressResult::error(-99, "Internal panic during compression"),
-    };
 }
 
 // ─── FFI: Compress file and write to output path ─────────────────────────────
@@ -197,84 +201,86 @@ pub unsafe extern "C" fn compress_buffer(
 /// - Both paths must be valid null-terminated UTF-8 C strings.
 /// - `out` must point to a valid, writable CompressResult.
 /// - Caller must free the result with `free_compress_result`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress_file_to_file(
     input_path: *const libc::c_char,
     output_path: *const libc::c_char,
     params: *const CompressParams,
     out: *mut CompressResult,
 ) {
-    if out.is_null() {
-        return;
-    }
-
-    if input_path.is_null() || output_path.is_null() || params.is_null() {
-        *out = CompressResult::error(-1, "Null pointer argument");
-        return;
-    }
-
-    let in_path = match CStr::from_ptr(input_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            *out = CompressResult::error(-2, "Invalid UTF-8 in input path");
+    unsafe {
+        if out.is_null() {
             return;
         }
-    };
 
-    let out_path = match CStr::from_ptr(output_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            *out = CompressResult::error(-2, "Invalid UTF-8 in output path");
+        if input_path.is_null() || output_path.is_null() || params.is_null() {
+            *out = CompressResult::error(-1, "Null pointer argument");
             return;
         }
-    };
 
-    let params = &*params;
-
-    let input_data = match std::fs::read(in_path) {
-        Ok(data) => data,
-        Err(e) => {
-            *out = CompressResult::error(-3, &format!("Failed to read file: {e}"));
-            return;
-        }
-    };
-
-    if input_data.len() > MAX_INPUT_SIZE {
-        *out = CompressResult::error(
-            -5,
-            &format!(
-                "Input file too large ({} bytes, max {})",
-                input_data.len(),
-                MAX_INPUT_SIZE
-            ),
-        );
-        return;
-    }
-
-    let original_size = input_data.len();
-
-    *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        compress::compress_bytes(&input_data, params)
-    })) {
-        Ok(Ok(result)) => {
-            let compressed_size = result.data.len();
-            if let Err(e) = std::fs::write(out_path, &result.data) {
-                CompressResult::error(-4, &format!("Failed to write output: {e}"))
-            } else {
-                CompressResult::success_without_data(
-                    compressed_size,
-                    original_size,
-                    result.width,
-                    result.height,
-                    result.quality_used,
-                    result.iterations,
-                    result.resized_to_fit,
-                )
+        let in_path = match CStr::from_ptr(input_path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out = CompressResult::error(-2, "Invalid UTF-8 in input path");
+                return;
             }
+        };
+
+        let out_path = match CStr::from_ptr(output_path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out = CompressResult::error(-2, "Invalid UTF-8 in output path");
+                return;
+            }
+        };
+
+        let params = &*params;
+
+        let input_data = match std::fs::read(in_path) {
+            Ok(data) => data,
+            Err(e) => {
+                *out = CompressResult::error(-3, &format!("Failed to read file: {e}"));
+                return;
+            }
+        };
+
+        if input_data.len() > MAX_INPUT_SIZE {
+            *out = CompressResult::error(
+                -5,
+                &format!(
+                    "Input file too large ({} bytes, max {})",
+                    input_data.len(),
+                    MAX_INPUT_SIZE
+                ),
+            );
+            return;
         }
-        Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
-        Err(_) => CompressResult::error(-99, "Internal panic during compression"),
-    };
+
+        let original_size = input_data.len();
+
+        *out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compress::compress_bytes(&input_data, params)
+        })) {
+            Ok(Ok(result)) => {
+                let compressed_size = result.data.len();
+                if let Err(e) = std::fs::write(out_path, &result.data) {
+                    CompressResult::error(-4, &format!("Failed to write output: {e}"))
+                } else {
+                    CompressResult::success_without_data(
+                        compressed_size,
+                        original_size,
+                        result.width,
+                        result.height,
+                        result.quality_used,
+                        result.iterations,
+                        result.resized_to_fit,
+                    )
+                }
+            }
+            Ok(Err(e)) => CompressResult::error(-10, &e.to_string()),
+            Err(_) => CompressResult::error(-99, "Internal panic during compression"),
+        };
+    }
 }
 
 // ─── FFI: Memory management ──────────────────────────────────────────────────
@@ -284,26 +290,28 @@ pub unsafe extern "C" fn compress_file_to_file(
 /// # Safety
 /// Must only be called once per result. The CompressResult struct itself
 /// is NOT freed — caller is responsible for freeing the outer allocation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_compress_result(result: *mut CompressResult) {
-    if result.is_null() {
-        return;
-    }
+    unsafe {
+        if result.is_null() {
+            return;
+        }
 
-    let r = &mut *result;
+        let r = &mut *result;
 
-    // Free the data buffer
-    if !r.data.is_null() && r.data_len > 0 {
-        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.data, r.data_len));
-    }
-    r.data = std::ptr::null_mut();
-    r.data_len = 0;
+        // Free the data buffer
+        if !r.data.is_null() && r.data_len > 0 {
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.data, r.data_len));
+        }
+        r.data = std::ptr::null_mut();
+        r.data_len = 0;
 
-    // Free the error message
-    if !r.error_message.is_null() {
-        let _ = std::ffi::CString::from_raw(r.error_message);
+        // Free the error message
+        if !r.error_message.is_null() {
+            let _ = std::ffi::CString::from_raw(r.error_message);
+        }
+        r.error_message = std::ptr::null_mut();
     }
-    r.error_message = std::ptr::null_mut();
 }
 
 // ─── FFI: Batch compression with rayon ───────────────────────────────────────
@@ -316,7 +324,7 @@ pub unsafe extern "C" fn free_compress_result(result: *mut CompressResult) {
 /// - `params` must point to a valid CompressParams.
 /// - `out` must point to a valid, writable BatchResult.
 /// - Caller must free the result with `free_batch_result`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn compress_batch(
     inputs: *const options::BatchInput,
     count: usize,
@@ -325,94 +333,96 @@ pub unsafe extern "C" fn compress_batch(
     _chunk_size: u32,
     out: *mut options::BatchResult,
 ) {
-    if out.is_null() {
-        return;
-    }
-
-    if inputs.is_null() || params.is_null() || count == 0 {
-        *out = options::BatchResult {
-            results: std::ptr::null_mut(),
-            count: 0,
-            elapsed_ms: 0,
-            completed: std::ptr::null_mut(),
-        };
-        return;
-    }
-
-    // Wrap entire batch operation in catch_unwind to prevent panics
-    // from crossing the FFI boundary (undefined behavior).
-    let batch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use rayon::prelude::*;
-        use std::time::Instant;
-
-        let params = &*params;
-        let inputs_slice = slice::from_raw_parts(inputs, count);
-
-        // ── Thread count: safe default leaves room for Flutter UI ──
-        let available = num_cpus_safe();
-        let num_threads = if thread_count > 0 {
-            (thread_count as usize).min(available).min(count.max(1))
-        } else {
-            available.saturating_sub(2).max(1).min(count.max(1))
-        };
-
-        // ── Chunk size: bounds peak memory ──
-        // Dart already chunks batch work when it needs chunk-boundary
-        // cancellation or progress semantics. Native batch parallelizes the
-        // provided slice directly to avoid a second scheduling layer.
-
-        // ── Atomic progress counter (Dart can poll this) ──
-        // Measure native wall-clock time for the provided slice.
-        let start = Instant::now();
-
-        // Reuse cached thread pool — avoids OS thread creation overhead on every call.
-        let pool = get_or_build_pool(num_threads);
-
-        // ── Process in chunks to bound memory ──
-        let all_results: Vec<CompressResult> = pool.install(|| {
-            inputs_slice
-                .par_iter()
-                .map(|input| {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process_batch_input(input, params)
-                    }));
-
-                    match result {
-                        Ok(r) => r,
-                        Err(_) => CompressResult::error(
-                            -99,
-                            "Internal panic during compression (possible OOM or corrupt image)",
-                        ),
-                    }
-                })
-                .collect()
-        });
-
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        // Move results into heap-allocated array for FFI
-        let mut boxed_results = all_results.into_boxed_slice();
-        let ptr = boxed_results.as_mut_ptr();
-        let len = boxed_results.len();
-        std::mem::forget(boxed_results);
-
-        options::BatchResult {
-            results: ptr,
-            count: len,
-            elapsed_ms,
-            completed: std::ptr::null_mut(),
+    unsafe {
+        if out.is_null() {
+            return;
         }
-    }));
 
-    *out = match batch_result {
-        Ok(result) => result,
-        Err(_) => options::BatchResult {
-            results: std::ptr::null_mut(),
-            count: 0,
-            elapsed_ms: 0,
-            completed: std::ptr::null_mut(),
-        },
-    };
+        if inputs.is_null() || params.is_null() || count == 0 {
+            *out = options::BatchResult {
+                results: std::ptr::null_mut(),
+                count: 0,
+                elapsed_ms: 0,
+                completed: std::ptr::null_mut(),
+            };
+            return;
+        }
+
+        // Wrap entire batch operation in catch_unwind to prevent panics
+        // from crossing the FFI boundary (undefined behavior).
+        let batch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use rayon::prelude::*;
+            use std::time::Instant;
+
+            let params = &*params;
+            let inputs_slice = slice::from_raw_parts(inputs, count);
+
+            // ── Thread count: safe default leaves room for Flutter UI ──
+            let available = num_cpus_safe();
+            let num_threads = if thread_count > 0 {
+                (thread_count as usize).min(available).min(count.max(1))
+            } else {
+                available.saturating_sub(2).max(1).min(count.max(1))
+            };
+
+            // ── Chunk size: bounds peak memory ──
+            // Dart already chunks batch work when it needs chunk-boundary
+            // cancellation or progress semantics. Native batch parallelizes the
+            // provided slice directly to avoid a second scheduling layer.
+
+            // ── Atomic progress counter (Dart can poll this) ──
+            // Measure native wall-clock time for the provided slice.
+            let start = Instant::now();
+
+            // Reuse cached thread pool — avoids OS thread creation overhead on every call.
+            let pool = get_or_build_pool(num_threads);
+
+            // ── Process in chunks to bound memory ──
+            let all_results: Vec<CompressResult> = pool.install(|| {
+                inputs_slice
+                    .par_iter()
+                    .map(|input| {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            process_batch_input(input, params)
+                        }));
+
+                        match result {
+                            Ok(r) => r,
+                            Err(_) => CompressResult::error(
+                                -99,
+                                "Internal panic during compression (possible OOM or corrupt image)",
+                            ),
+                        }
+                    })
+                    .collect()
+            });
+
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+
+            // Move results into heap-allocated array for FFI
+            let mut boxed_results = all_results.into_boxed_slice();
+            let ptr = boxed_results.as_mut_ptr();
+            let len = boxed_results.len();
+            std::mem::forget(boxed_results);
+
+            options::BatchResult {
+                results: ptr,
+                count: len,
+                elapsed_ms,
+                completed: std::ptr::null_mut(),
+            }
+        }));
+
+        *out = match batch_result {
+            Ok(result) => result,
+            Err(_) => options::BatchResult {
+                results: std::ptr::null_mut(),
+                count: 0,
+                elapsed_ms: 0,
+                completed: std::ptr::null_mut(),
+            },
+        };
+    }
 }
 
 /// Process a single batch input item. Called from rayon worker threads.
@@ -420,67 +430,69 @@ unsafe fn process_batch_input(
     input: &options::BatchInput,
     params: &CompressParams,
 ) -> CompressResult {
-    // Read input data — file path or memory buffer
-    let input_data: Cow<'_, [u8]> = if !input.file_path.is_null() {
-        let path = match CStr::from_ptr(input.file_path).to_str() {
-            Ok(s) => s,
-            Err(_) => return CompressResult::error(-2, "Invalid UTF-8 in file path"),
-        };
-        match std::fs::read(path) {
-            Ok(data) => Cow::Owned(data),
-            Err(e) => {
-                return CompressResult::error(-3, &format!("Failed to read: {e}"));
+    unsafe {
+        // Read input data — file path or memory buffer
+        let input_data: Cow<'_, [u8]> = if !input.file_path.is_null() {
+            let path = match CStr::from_ptr(input.file_path).to_str() {
+                Ok(s) => s,
+                Err(_) => return CompressResult::error(-2, "Invalid UTF-8 in file path"),
+            };
+            match std::fs::read(path) {
+                Ok(data) => Cow::Owned(data),
+                Err(e) => {
+                    return CompressResult::error(-3, &format!("Failed to read: {e}"));
+                }
             }
-        }
-    } else if !input.data.is_null() && input.data_len > 0 {
-        Cow::Borrowed(slice::from_raw_parts(input.data, input.data_len))
-    } else {
-        return CompressResult::error(-1, "BatchInput has no file_path or data");
-    };
-    let original_size = input_data.len();
-
-    if original_size > MAX_INPUT_SIZE {
-        return CompressResult::error(
-            -5,
-            &format!("Input too large ({original_size} bytes, max {MAX_INPUT_SIZE})"),
-        );
-    }
-
-    // Compress
-    let compress_result = match compress::compress_bytes(input_data.as_ref(), params) {
-        Ok(r) => r,
-        Err(e) => return CompressResult::error(-10, &e.to_string()),
-    };
-
-    // Write to output file if path provided
-    if !input.output_path.is_null() {
-        let out_path = match CStr::from_ptr(input.output_path).to_str() {
-            Ok(s) => s,
-            Err(_) => return CompressResult::error(-2, "Invalid UTF-8 in output path"),
+        } else if !input.data.is_null() && input.data_len > 0 {
+            Cow::Borrowed(slice::from_raw_parts(input.data, input.data_len))
+        } else {
+            return CompressResult::error(-1, "BatchInput has no file_path or data");
         };
-        let compressed_size = compress_result.data.len();
-        if let Err(e) = std::fs::write(out_path, &compress_result.data) {
-            return CompressResult::error(-4, &format!("Failed to write: {e}"));
+        let original_size = input_data.len();
+
+        if original_size > MAX_INPUT_SIZE {
+            return CompressResult::error(
+                -5,
+                &format!("Input too large ({original_size} bytes, max {MAX_INPUT_SIZE})"),
+            );
         }
-        CompressResult::success_without_data(
-            compressed_size,
-            original_size,
-            compress_result.width,
-            compress_result.height,
-            compress_result.quality_used,
-            compress_result.iterations,
-            compress_result.resized_to_fit,
-        )
-    } else {
-        CompressResult::success(
-            compress_result.data,
-            original_size,
-            compress_result.width,
-            compress_result.height,
-            compress_result.quality_used,
-            compress_result.iterations,
-            compress_result.resized_to_fit,
-        )
+
+        // Compress
+        let compress_result = match compress::compress_bytes(input_data.as_ref(), params) {
+            Ok(r) => r,
+            Err(e) => return CompressResult::error(-10, &e.to_string()),
+        };
+
+        // Write to output file if path provided
+        if !input.output_path.is_null() {
+            let out_path = match CStr::from_ptr(input.output_path).to_str() {
+                Ok(s) => s,
+                Err(_) => return CompressResult::error(-2, "Invalid UTF-8 in output path"),
+            };
+            let compressed_size = compress_result.data.len();
+            if let Err(e) = std::fs::write(out_path, &compress_result.data) {
+                return CompressResult::error(-4, &format!("Failed to write: {e}"));
+            }
+            CompressResult::success_without_data(
+                compressed_size,
+                original_size,
+                compress_result.width,
+                compress_result.height,
+                compress_result.quality_used,
+                compress_result.iterations,
+                compress_result.resized_to_fit,
+            )
+        } else {
+            CompressResult::success(
+                compress_result.data,
+                original_size,
+                compress_result.width,
+                compress_result.height,
+                compress_result.quality_used,
+                compress_result.iterations,
+                compress_result.resized_to_fit,
+            )
+        }
     }
 }
 
@@ -495,38 +507,40 @@ fn num_cpus_safe() -> usize {
 ///
 /// # Safety
 /// Must only be called once per batch result.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_batch_result(result: *mut options::BatchResult) {
-    if result.is_null() {
-        return;
-    }
-
-    let batch = &mut *result;
-
-    if !batch.results.is_null() && batch.count > 0 {
-        for i in 0..batch.count {
-            let r = &mut *batch.results.add(i);
-
-            if !r.data.is_null() && r.data_len > 0 {
-                let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.data, r.data_len));
-                r.data = std::ptr::null_mut();
-            }
-
-            if !r.error_message.is_null() {
-                let _ = std::ffi::CString::from_raw(r.error_message);
-                r.error_message = std::ptr::null_mut();
-            }
+    unsafe {
+        if result.is_null() {
+            return;
         }
 
-        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-            batch.results,
-            batch.count,
-        ));
-        batch.results = std::ptr::null_mut();
-    }
+        let batch = &mut *result;
 
-    batch.completed = std::ptr::null_mut();
-    batch.count = 0;
+        if !batch.results.is_null() && batch.count > 0 {
+            for i in 0..batch.count {
+                let r = &mut *batch.results.add(i);
+
+                if !r.data.is_null() && r.data_len > 0 {
+                    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.data, r.data_len));
+                    r.data = std::ptr::null_mut();
+                }
+
+                if !r.error_message.is_null() {
+                    let _ = std::ffi::CString::from_raw(r.error_message);
+                    r.error_message = std::ptr::null_mut();
+                }
+            }
+
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                batch.results,
+                batch.count,
+            ));
+            batch.results = std::ptr::null_mut();
+        }
+
+        batch.completed = std::ptr::null_mut();
+        batch.count = 0;
+    }
 }
 
 // ─── FFI: Probe (quick metadata) ─────────────────────────────────────────────
@@ -536,37 +550,39 @@ pub unsafe extern "C" fn free_batch_result(result: *mut options::BatchResult) {
 /// # Safety
 /// - `input_path` must be a valid null-terminated UTF-8 C string.
 /// - `out` must point to a valid, writable ProbeResult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn probe_file(
     input_path: *const libc::c_char,
     out: *mut options::ProbeResult,
 ) {
-    if out.is_null() {
-        return;
-    }
-
-    if input_path.is_null() {
-        *out = options::ProbeResult::error(-1, "Null pointer argument");
-        return;
-    }
-
-    let path = match CStr::from_ptr(input_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            *out = options::ProbeResult::error(-2, "Invalid UTF-8 in path");
+    unsafe {
+        if out.is_null() {
             return;
         }
-    };
 
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            *out = options::ProbeResult::error(-3, &format!("Failed to read: {e}"));
+        if input_path.is_null() {
+            *out = options::ProbeResult::error(-1, "Null pointer argument");
             return;
         }
-    };
 
-    *out = probe_bytes_impl(&data);
+        let path = match CStr::from_ptr(input_path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out = options::ProbeResult::error(-2, "Invalid UTF-8 in path");
+                return;
+            }
+        };
+
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                *out = options::ProbeResult::error(-3, &format!("Failed to read: {e}"));
+                return;
+            }
+        };
+
+        *out = probe_bytes_impl(&data);
+    }
 }
 
 /// Read image metadata from a memory buffer without decoding.
@@ -574,23 +590,25 @@ pub unsafe extern "C" fn probe_file(
 /// # Safety
 /// - `input_data` must point to a valid buffer of `input_len` bytes.
 /// - `out` must point to a valid, writable ProbeResult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn probe_buffer(
     input_data: *const u8,
     input_len: usize,
     out: *mut options::ProbeResult,
 ) {
-    if out.is_null() {
-        return;
-    }
+    unsafe {
+        if out.is_null() {
+            return;
+        }
 
-    if input_data.is_null() || input_len == 0 {
-        *out = options::ProbeResult::error(-1, "Null or empty input");
-        return;
-    }
+        if input_data.is_null() || input_len == 0 {
+            *out = options::ProbeResult::error(-1, "Null or empty input");
+            return;
+        }
 
-    let data = slice::from_raw_parts(input_data, input_len);
-    *out = probe_bytes_impl(data);
+        let data = slice::from_raw_parts(input_data, input_len);
+        *out = probe_bytes_impl(data);
+    }
 }
 
 fn probe_bytes_impl(data: &[u8]) -> options::ProbeResult {
@@ -618,15 +636,17 @@ fn probe_bytes_impl(data: &[u8]) -> options::ProbeResult {
 ///
 /// # Safety
 /// `result` must be a valid pointer to a ProbeResult, or null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_probe_result(result: *mut options::ProbeResult) {
-    if result.is_null() {
-        return;
-    }
-    let r = &mut *result;
-    if !r.error_message.is_null() {
-        let _ = std::ffi::CString::from_raw(r.error_message);
-        r.error_message = std::ptr::null_mut();
+    unsafe {
+        if result.is_null() {
+            return;
+        }
+        let r = &mut *result;
+        if !r.error_message.is_null() {
+            let _ = std::ffi::CString::from_raw(r.error_message);
+            r.error_message = std::ptr::null_mut();
+        }
     }
 }
 
@@ -639,39 +659,41 @@ pub unsafe extern "C" fn free_probe_result(result: *mut options::ProbeResult) {
 /// - `params` must be a valid pointer.
 /// - `out` must point to a valid, writable BenchmarkResult.
 /// - Caller must free with `free_benchmark_result`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn benchmark_file(
     input_path: *const libc::c_char,
     params: *const options::CompressParams,
     out: *mut options::BenchmarkResult,
 ) {
-    if out.is_null() {
-        return;
-    }
-
-    if input_path.is_null() || params.is_null() {
-        *out = benchmark_error(-1, "Null pointer argument");
-        return;
-    }
-
-    let path = match CStr::from_ptr(input_path).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            *out = benchmark_error(-2, "Invalid UTF-8 in path");
+    unsafe {
+        if out.is_null() {
             return;
         }
-    };
 
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            *out = benchmark_error(-3, &format!("Failed to read: {e}"));
+        if input_path.is_null() || params.is_null() {
+            *out = benchmark_error(-1, "Null pointer argument");
             return;
         }
-    };
 
-    let params = &*params;
-    *out = benchmark_bytes_impl(&data, params);
+        let path = match CStr::from_ptr(input_path).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out = benchmark_error(-2, "Invalid UTF-8 in path");
+                return;
+            }
+        };
+
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                *out = benchmark_error(-3, &format!("Failed to read: {e}"));
+                return;
+            }
+        };
+
+        let params = &*params;
+        *out = benchmark_bytes_impl(&data, params);
+    }
 }
 
 /// Run a quality sweep on a memory buffer.
@@ -679,25 +701,27 @@ pub unsafe extern "C" fn benchmark_file(
 /// # Safety
 /// - `input_data` must point to a valid buffer of `input_len` bytes.
 /// - `out` must point to a valid, writable BenchmarkResult.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn benchmark_buffer(
     input_data: *const u8,
     input_len: usize,
     params: *const options::CompressParams,
     out: *mut options::BenchmarkResult,
 ) {
-    if out.is_null() {
-        return;
-    }
+    unsafe {
+        if out.is_null() {
+            return;
+        }
 
-    if input_data.is_null() || params.is_null() || input_len == 0 {
-        *out = benchmark_error(-1, "Null or empty input");
-        return;
-    }
+        if input_data.is_null() || params.is_null() || input_len == 0 {
+            *out = benchmark_error(-1, "Null or empty input");
+            return;
+        }
 
-    let data = slice::from_raw_parts(input_data, input_len);
-    let params = &*params;
-    *out = benchmark_bytes_impl(data, params);
+        let data = slice::from_raw_parts(input_data, input_len);
+        let params = &*params;
+        *out = benchmark_bytes_impl(data, params);
+    }
 }
 
 fn benchmark_bytes_impl(data: &[u8], params: &options::CompressParams) -> options::BenchmarkResult {
@@ -760,19 +784,21 @@ fn benchmark_error(code: i32, message: &str) -> options::BenchmarkResult {
 ///
 /// # Safety
 /// `result` must be a valid pointer to a BenchmarkResult, or null.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_benchmark_result(result: *mut options::BenchmarkResult) {
-    if result.is_null() {
-        return;
-    }
-    let r = &mut *result;
-    if !r.entries.is_null() && r.entry_count > 0 {
-        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.entries, r.entry_count));
-        r.entries = std::ptr::null_mut();
-    }
-    if !r.error_message.is_null() {
-        let _ = std::ffi::CString::from_raw(r.error_message);
-        r.error_message = std::ptr::null_mut();
+    unsafe {
+        if result.is_null() {
+            return;
+        }
+        let r = &mut *result;
+        if !r.entries.is_null() && r.entry_count > 0 {
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(r.entries, r.entry_count));
+            r.entries = std::ptr::null_mut();
+        }
+        if !r.error_message.is_null() {
+            let _ = std::ffi::CString::from_raw(r.error_message);
+            r.error_message = std::ptr::null_mut();
+        }
     }
 }
 
@@ -780,7 +806,7 @@ pub unsafe extern "C" fn free_benchmark_result(result: *mut options::BenchmarkRe
 
 /// Return the library version as a null-terminated C string.
 /// The returned pointer is static and must NOT be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ironpress_version() -> *const libc::c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const libc::c_char
 }

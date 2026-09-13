@@ -46,9 +46,8 @@ class _BatchScreenState extends State<BatchScreen> {
       setState(() => _batch = batch);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     } finally {
       setState(() {
@@ -87,8 +86,9 @@ class _BatchScreenState extends State<BatchScreen> {
                       max: 20,
                       divisions: 19,
                       label: _count.round().toString(),
-                      onChanged:
-                          _loading ? null : (v) => setState(() => _count = v),
+                      onChanged: _loading
+                          ? null
+                          : (v) => setState(() => _count = v),
                     ),
                     const SizedBox(height: 8),
                     Row(

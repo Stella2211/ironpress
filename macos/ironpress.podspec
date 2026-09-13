@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'ironpress'
-  s.version          = '0.1.0'
+  s.version          = '0.3.0'
   s.summary          = 'High-performance image compression powered by Rust'
   s.description      = <<-DESC
     Flutter plugin providing Rust-powered image compression.

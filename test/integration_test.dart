@@ -913,14 +913,14 @@ void main() {
       });
     });
 
-    test('nativeVersion returns a non-empty string', () {
+    test('nativeVersion matches the packaged native release', () {
       if (!_nativeLibraryAvailable()) {
         markTestSkipped('Native library not available');
         return;
       }
 
       final version = Ironpress.nativeVersion;
-      expect(version, isNotEmpty);
+      expect(version, '0.3.0');
     });
   });
 }

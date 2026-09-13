@@ -73,7 +73,7 @@ mod tests {
         // Inject a fake APP1/Exif segment right after SOI (FF D8)
         let mut out = Vec::new();
         out.extend_from_slice(&base[..2]); // SOI: FF D8
-                                           // APP1 marker: FF E1
+        // APP1 marker: FF E1
         out.push(0xFF);
         out.push(0xE1);
         // Segment length (includes length field itself): 2 + 6 (Exif\0\0) + 2 (dummy) = 10

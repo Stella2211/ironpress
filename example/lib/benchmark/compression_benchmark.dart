@@ -1,4 +1,5 @@
 import 'dart:isolate';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart' as fic;
@@ -117,10 +118,9 @@ class BatchBenchmarkResult {
   double get imagesPerSecond =>
       medianElapsedMs > 0 ? batchCount / (medianElapsedMs / 1000.0) : 0;
 
-  double get mbPerSecond =>
-      medianElapsedMs > 0
-          ? (totalInputBytes / (1024 * 1024)) / (medianElapsedMs / 1000.0)
-          : 0;
+  double get mbPerSecond => medianElapsedMs > 0
+      ? (totalInputBytes / (1024 * 1024)) / (medianElapsedMs / 1000.0)
+      : 0;
 }
 
 class _SingleRunSample {
@@ -413,8 +413,9 @@ Future<ComparisonBenchmarkResult> runCompressionBenchmark(
     const ImagePackageBenchmarkAdapter(),
   ];
 
-  final availableAdapters =
-      adapters.where((adapter) => adapter.unsupportedReason() == null).toList();
+  final availableAdapters = adapters
+      .where((adapter) => adapter.unsupportedReason() == null)
+      .toList();
   final totalSteps =
       availableAdapters.length *
           (2 + config.singleRuns + 2 + config.batchRuns) +

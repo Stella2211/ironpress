@@ -58,9 +58,8 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
       });
     } catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $error')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $error')));
       }
     } finally {
       if (mounted) {
@@ -110,10 +109,9 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
                       max: 95,
                       divisions: 55,
                       label: _quality.round().toString(),
-                      onChanged:
-                          _loading
-                              ? null
-                              : (value) => setState(() => _quality = value),
+                      onChanged: _loading
+                          ? null
+                          : (value) => setState(() => _quality = value),
                     ),
                     Text(
                       'Batch images: ${_batchCount.round()}',
@@ -125,10 +123,9 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
                       max: 20,
                       divisions: 16,
                       label: _batchCount.round().toString(),
-                      onChanged:
-                          _loading
-                              ? null
-                              : (value) => setState(() => _batchCount = value),
+                      onChanged: _loading
+                          ? null
+                          : (value) => setState(() => _batchCount = value),
                     ),
                     const SizedBox(height: 8),
                     Row(
@@ -459,12 +456,13 @@ class _BenchmarkScreenState extends State<BenchmarkScreen> {
                         DataRow(
                           color:
                               entry.quality ==
-                                      result.ironpressSweep.recommendedQuality
-                                  ? WidgetStateProperty.all(
-                                    theme.colorScheme.primaryContainer
-                                        .withAlpha(80),
-                                  )
-                                  : null,
+                                  result.ironpressSweep.recommendedQuality
+                              ? WidgetStateProperty.all(
+                                  theme.colorScheme.primaryContainer.withAlpha(
+                                    80,
+                                  ),
+                                )
+                              : null,
                           cells: [
                             DataCell(Text('q${entry.quality}')),
                             DataCell(Text(entry.sizeFormatted)),
@@ -624,10 +622,9 @@ class _BarRow extends StatelessWidget {
                   child: Container(
                     height: 18,
                     decoration: BoxDecoration(
-                      color:
-                          isRecommended
-                              ? theme.colorScheme.primary
-                              : theme.colorScheme.primaryContainer,
+                      color: isRecommended
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.primaryContainer,
                       borderRadius: BorderRadius.circular(3),
                     ),
                   ),
@@ -658,9 +655,9 @@ PackageBenchmarkResult? _mostEfficientPackage(
   return packages.reduce(
     (best, next) =>
         next.single!.bytesSavedPerMs(originalBytes) >
-                best.single!.bytesSavedPerMs(originalBytes)
-            ? next
-            : best,
+            best.single!.bytesSavedPerMs(originalBytes)
+        ? next
+        : best,
   );
 }
 
@@ -669,10 +666,9 @@ PackageBenchmarkResult? _fastestSinglePackage(
 ) {
   if (packages.isEmpty) return null;
   return packages.reduce(
-    (best, next) =>
-        next.single!.medianElapsedMs < best.single!.medianElapsedMs
-            ? next
-            : best,
+    (best, next) => next.single!.medianElapsedMs < best.single!.medianElapsedMs
+        ? next
+        : best,
   );
 }
 

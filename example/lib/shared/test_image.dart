@@ -31,19 +31,18 @@ Future<Uint8List> _generateTestImage() async {
   final canvas = ui.Canvas(recorder);
 
   // Background gradient
-  final bgPaint =
-      ui.Paint()
-        ..shader = ui.Gradient.linear(
-          ui.Offset.zero,
-          const ui.Offset(2048, 1536),
-          [
-            const ui.Color(0xFF1A237E),
-            const ui.Color(0xFF0D47A1),
-            const ui.Color(0xFF00838F),
-            const ui.Color(0xFF00695C),
-          ],
-          [0.0, 0.33, 0.66, 1.0],
-        );
+  final bgPaint = ui.Paint()
+    ..shader = ui.Gradient.linear(
+      ui.Offset.zero,
+      const ui.Offset(2048, 1536),
+      [
+        const ui.Color(0xFF1A237E),
+        const ui.Color(0xFF0D47A1),
+        const ui.Color(0xFF00838F),
+        const ui.Color(0xFF00695C),
+      ],
+      [0.0, 0.33, 0.66, 1.0],
+    );
   canvas.drawRect(const ui.Rect.fromLTWH(0, 0, 2048, 1536), bgPaint);
 
   // Add overlapping circles with radial gradients for texture
@@ -66,28 +65,26 @@ Future<Uint8List> _generateTestImage() async {
   final radii = [307.0, 256.0, 358.0, 230.0, 282.0, 333.0];
 
   for (var i = 0; i < colors.length; i++) {
-    final paint =
-        ui.Paint()
-          ..shader = ui.Gradient.radial(positions[i], radii[i], [
-            colors[i],
-            colors[i].withAlpha(0),
-          ]);
+    final paint = ui.Paint()
+      ..shader = ui.Gradient.radial(positions[i], radii[i], [
+        colors[i],
+        colors[i].withAlpha(0),
+      ]);
     canvas.drawCircle(positions[i], radii[i], paint);
   }
 
   // Add some rectangles for edge detail
   for (var x = 0; x < width; x += 80) {
     for (var y = 0; y < height; y += 80) {
-      final paint =
-          ui.Paint()
-            ..color = ui.Color.fromARGB(
-              20,
-              (x * 3 + y) % 256,
-              (y * 2 + x) % 256,
-              (x + y) % 256,
-            )
-            ..style = ui.PaintingStyle.stroke
-            ..strokeWidth = 1.0;
+      final paint = ui.Paint()
+        ..color = ui.Color.fromARGB(
+          20,
+          (x * 3 + y) % 256,
+          (y * 2 + x) % 256,
+          (x + y) % 256,
+        )
+        ..style = ui.PaintingStyle.stroke
+        ..strokeWidth = 1.0;
       canvas.drawRect(
         ui.Rect.fromLTWH(x.toDouble(), y.toDouble(), 60, 60),
         paint,

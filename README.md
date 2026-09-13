@@ -62,7 +62,7 @@ For desktop Flutter apps, the packaged native library is expected to be bundled 
 
 ```yaml
 dependencies:
-  ironpress: ^0.2.0
+  ironpress: ^0.3.0
 ```
 
 ### Basic Usage

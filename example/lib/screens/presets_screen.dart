@@ -47,9 +47,8 @@ class _PresetsScreenState extends State<PresetsScreen> {
       setState(() {});
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     } finally {
       setState(() => _loading = false);
@@ -60,20 +59,19 @@ class _PresetsScreenState extends State<PresetsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Quality Presets')),
-      body:
-          _loading
-              ? const Center(child: CircularProgressIndicator())
-              : ListView(
-                padding: const EdgeInsets.all(16),
-                children: [
-                  for (final entry in _results.entries)
-                    _PresetCard(
-                      name: entry.key,
-                      result: entry.value,
-                      original: _original,
-                    ),
-                ],
-              ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                for (final entry in _results.entries)
+                  _PresetCard(
+                    name: entry.key,
+                    result: entry.value,
+                    original: _original,
+                  ),
+              ],
+            ),
     );
   }
 }

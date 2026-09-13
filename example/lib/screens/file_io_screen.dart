@@ -42,9 +42,8 @@ class _FileIoScreenState extends State<FileIoScreen> {
       setState(() => _compressFileResult = result);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     } finally {
       setState(() => _loading = false);
@@ -75,9 +74,8 @@ class _FileIoScreenState extends State<FileIoScreen> {
       setState(() => _fileToFileResult = result);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     } finally {
       setState(() => _loading = false);

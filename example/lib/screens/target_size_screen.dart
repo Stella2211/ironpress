@@ -54,9 +54,8 @@ class _TargetSizeScreenState extends State<TargetSizeScreen> {
       setState(() => _result = result);
     } catch (e) {
       if (mounted && requestId == _requestId) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Error: $e')));
       }
     } finally {
       if (mounted && requestId == _requestId) {
@@ -147,9 +146,9 @@ class _TargetSizeScreenState extends State<TargetSizeScreen> {
                         label: 'Met target',
                         value:
                             _result!.compressedSize <=
-                                    (_targetKB * 1024).round()
-                                ? 'Yes'
-                                : 'No',
+                                (_targetKB * 1024).round()
+                            ? 'Yes'
+                            : 'No',
                       ),
                     ],
                   ),

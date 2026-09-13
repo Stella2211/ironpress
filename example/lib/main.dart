@@ -112,29 +112,28 @@ class HomeScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('ironpress'),
         centerTitle: false,
-        bottom:
-            version != null
-                ? PreferredSize(
-                  preferredSize: const Size.fromHeight(20),
-                  child: Padding(
-                    padding: const EdgeInsets.only(left: 16, bottom: 8),
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'Native library $version',
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
+        bottom: version != null
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(20),
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 16, bottom: 8),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Native library $version',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
-                )
-                : null,
+                ),
+              )
+            : null,
       ),
       body: ListView.separated(
         padding: const EdgeInsets.symmetric(vertical: 8),
         itemCount: _features.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 2),
+        separatorBuilder: (_, _) => const SizedBox(height: 2),
         itemBuilder: (context, index) {
           final f = _features[index];
           return ListTile(
@@ -145,11 +144,8 @@ class HomeScreen extends StatelessWidget {
             title: Text(f.title),
             subtitle: Text(f.subtitle),
             trailing: const Icon(Icons.chevron_right),
-            onTap:
-                () => Navigator.push(
-                  context,
-                  MaterialPageRoute(builder: f.builder),
-                ),
+            onTap: () =>
+                Navigator.push(context, MaterialPageRoute(builder: f.builder)),
           );
         },
       ),

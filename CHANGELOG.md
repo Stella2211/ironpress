@@ -1,3 +1,20 @@
+## 0.3.0
+
+### Toolchain and dependency upgrades
+
+- Requires Dart 3.13.0 or later and Flutter 3.47.0 or later.
+- Updates the Rust crate to edition 2024 and publishes native version 0.3.0.
+- Updates the Rust image stack to image 0.25.10, mozjpeg-rs 0.9.2, oxipng 10.2.1, fast_image_resize 6.1.0, zune-jpeg 0.5.15, rayon 1.12.0, and libc 0.2.189.
+- Refreshes the Android Gradle Plugin to 9.4.0 and Android compile SDK to API 37.
+- Rebuilds all packaged native libraries from the updated lockfile; macOS install names and iOS xcframework slice names remain relocatable and consistent.
+
+### Breaking changes
+
+- Minimum Dart and Flutter versions have increased to Dart 3.13.0 and Flutter 3.47.0.
+- Native version metadata and CocoaPods specs now report 0.3.0.
+
+---
+
 ## 0.2.0
 
 ### Performance

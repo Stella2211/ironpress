@@ -13,9 +13,9 @@ use crate::options::{ChromaSubsampling, CompressParams, OutputFormat};
 /// Decode a JPEG using zune-jpeg (SIMD-accelerated, 2-4x faster than image crate).
 /// Falls back to the image crate if zune-jpeg fails.
 fn decode_jpeg_fast(data: &[u8]) -> Result<DynamicImage, CompressError> {
+    use zune_jpeg::JpegDecoder;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
-    use zune_jpeg::JpegDecoder;
 
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(Cursor::new(data), options);

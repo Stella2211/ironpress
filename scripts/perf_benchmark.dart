@@ -261,40 +261,35 @@ Future<List<_CorpusEntry>> _buildDefaultCorpus() async {
   }
 
   final sourcePngBytes = await sourcePng.readAsBytes();
-  final generatedJpeg =
-      (await Ironpress.compressBytes(
-        sourcePngBytes,
-        format: CompressFormat.jpeg,
-        quality: 90,
-        keepMetadata: false,
-      )).data!;
-  final generatedWebpLossy =
-      (await Ironpress.compressBytes(
-        sourcePngBytes,
-        format: CompressFormat.webpLossy,
-        quality: 80,
-      )).data!;
-  final generatedWebpLossless =
-      (await Ironpress.compressBytes(
-        sourcePngBytes,
-        format: CompressFormat.webpLossless,
-      )).data!;
-  final generatedThumbJpeg =
-      (await Ironpress.compressBytes(
-        sourcePngBytes,
-        format: CompressFormat.jpeg,
-        quality: 82,
-        maxWidth: 48,
-        maxHeight: 48,
-      )).data!;
-  final generatedThumbWebp =
-      (await Ironpress.compressBytes(
-        sourcePngBytes,
-        format: CompressFormat.webpLossy,
-        quality: 82,
-        maxWidth: 48,
-        maxHeight: 48,
-      )).data!;
+  final generatedJpeg = (await Ironpress.compressBytes(
+    sourcePngBytes,
+    format: CompressFormat.jpeg,
+    quality: 90,
+    keepMetadata: false,
+  )).data!;
+  final generatedWebpLossy = (await Ironpress.compressBytes(
+    sourcePngBytes,
+    format: CompressFormat.webpLossy,
+    quality: 80,
+  )).data!;
+  final generatedWebpLossless = (await Ironpress.compressBytes(
+    sourcePngBytes,
+    format: CompressFormat.webpLossless,
+  )).data!;
+  final generatedThumbJpeg = (await Ironpress.compressBytes(
+    sourcePngBytes,
+    format: CompressFormat.jpeg,
+    quality: 82,
+    maxWidth: 48,
+    maxHeight: 48,
+  )).data!;
+  final generatedThumbWebp = (await Ironpress.compressBytes(
+    sourcePngBytes,
+    format: CompressFormat.webpLossy,
+    quality: 82,
+    maxWidth: 48,
+    maxHeight: 48,
+  )).data!;
 
   return <_CorpusEntry>[
     await writeEntry('large_png_alpha.png', sourcePngBytes),
@@ -469,20 +464,19 @@ String _buildReport(
     0,
     (sum, entry) => sum + entry.bytes.length,
   );
-  final buffer =
-      StringBuffer()
-        ..writeln()
-        ..writeln('# ironpress performance benchmark')
-        ..writeln()
-        ..writeln(
-          'Config: warmup=${config.warmupRuns}, runs=${config.measureRuns}, '
-          'batchSize=${config.batchSize}, chunkSize=${config.chunkSize}, '
-          'threadCount=${config.threadCount}, quality=${config.quality}',
-        )
-        ..writeln()
-        ..writeln(
-          'Corpus: ${corpus.length} items, total input ${_formatBytes(totalInputBytes)}',
-        );
+  final buffer = StringBuffer()
+    ..writeln()
+    ..writeln('# ironpress performance benchmark')
+    ..writeln()
+    ..writeln(
+      'Config: warmup=${config.warmupRuns}, runs=${config.measureRuns}, '
+      'batchSize=${config.batchSize}, chunkSize=${config.chunkSize}, '
+      'threadCount=${config.threadCount}, quality=${config.quality}',
+    )
+    ..writeln()
+    ..writeln(
+      'Corpus: ${corpus.length} items, total input ${_formatBytes(totalInputBytes)}',
+    );
 
   if (config.corpusDir == null) {
     buffer

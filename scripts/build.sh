@@ -36,6 +36,7 @@ build_android() {
         "aarch64-linux-android:arm64-v8a"
         "armv7-linux-androideabi:armeabi-v7a"
         "x86_64-linux-android:x86_64"
+        "i686-linux-android:x86"
     )
 
     for entry in "${targets[@]}"; do
@@ -78,7 +79,7 @@ show_usage() {
     echo "Usage: $0 {android|windows|all}"
     echo ""
     echo "Commands:"
-    echo "  android    Build Android .so for arm64, armv7, x86_64"
+    echo "  android    Build Android .so for arm64, armv7, x86_64, x86"
     echo "  windows    Build Windows x64 DLL"
     echo "  all        Build all platforms"
 }
