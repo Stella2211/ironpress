@@ -1,3 +1,15 @@
+## Unreleased
+
+### Toolchain and dependency upgrades
+
+- Builds packaged native libraries with Rust 1.99.0 and Android NDK r30 (30.0.16248370).
+- Updates libc to 0.2.190 and refreshes the Rust lockfile (cc 1.8.0, zlib-rs 0.6.8, libdeflater 1.26.1, zerocopy 0.8.63, and others).
+- Refreshes the Android Gradle Plugin to 9.4.1 and CI Flutter to 3.47.7.
+- Updates example dependencies to image 4.12.0 and flutter_image_compress 2.5.1.
+- Rebuilds all packaged native libraries from the updated lockfile. No public Dart API changes.
+
+---
+
 ## 0.3.0
 
 ### Toolchain and dependency upgrades
