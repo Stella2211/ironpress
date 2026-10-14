@@ -120,6 +120,59 @@ jobs:
       - name: Smoke test bundled macOS library
         run: flutter test --dart-define=IRONPRESS_NATIVE_REQUIRED=true test/integration_test.dart --plain-name "produces non-empty output with valid stats"
 
+  darwin-integration:
+    name: Darwin example build (${{ matrix.integration }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        integration: [swiftpm, cocoapods]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Select dependency manager
+        run: |
+          if [ "${{ matrix.integration }}" = "swiftpm" ]; then
+            flutter config --enable-swift-package-manager
+          else
+            flutter config --no-enable-swift-package-manager
+          fi
+
+      - name: Generate example platform runners
+        working-directory: example
+        run: flutter create --platforms=ios,macos --org dev.rickyirfandi .
+
+      - name: Build macOS and iOS simulator
+        working-directory: example
+        run: |
+          set -o pipefail
+          flutter build macos --debug 2>&1 | tee build.log
+          flutter build ios --simulator --debug 2>&1 | tee -a build.log
+          if grep -q "Plugin ironpress" build.log; then
+            echo "::error::Flutter reported a Swift Package Manager issue for ironpress"
+            exit 1
+          fi
+
+      - name: Verify embedded framework
+        working-directory: example
+        run: |
+          set -e
+          mac_fw=$(echo build/macos/Build/Products/Debug/*.app/Contents/Frameworks/ironpress_native.framework)
+          ios_fw=build/ios/iphonesimulator/Runner.app/Frameworks/ironpress_native.framework
+          codesign --verify --strict "$mac_fw"
+          codesign --verify --strict "$ios_fw"
+          plutil -p "$ios_fw/Info.plist" | grep MinimumOSVersion
+          if [ "${{ matrix.integration }}" = "swiftpm" ]; then
+            test ! -f macos/Podfile.lock
+          else
+            grep -q "ironpress" macos/Podfile.lock
+          fi
+
   publish-check:
     name: pub publish --dry-run
     runs-on: ubuntu-latest

@@ -3,6 +3,21 @@ import 'dart:io';
 
 const String _libName = 'ironpress';
 
+/// Name of the dynamic framework shipped in
+/// `darwin/ironpress/Frameworks/ironpress_native.xcframework` for iOS and
+/// macOS. It differs from the plugin's own `ironpress` Swift module so the two
+/// never collide when CocoaPods or Swift Package Manager build frameworks.
+const String _darwinFrameworkName = 'ironpress_native';
+
+/// Framework-relative path resolved by dyld through the app's `@rpath`
+/// (`Frameworks/` on iOS, `Contents/Frameworks/` on macOS).
+const String _darwinFrameworkPath =
+    '$_darwinFrameworkName.framework/$_darwinFrameworkName';
+
+/// Exported symbol used to verify that [DynamicLibrary.process] actually
+/// contains the engine before falling back to it.
+const String _probeSymbol = 'ironpress_abi_version';
+
 /// Load the native library for the current platform.
 ///
 /// Throws [UnsupportedError] if the current platform is not supported.
@@ -19,19 +34,31 @@ DynamicLibrary loadNativeLibrary() {
   }
 
   if (Platform.isIOS) {
-    return DynamicLibrary.process();
+    return _tryOpenCandidates(
+      const [_darwinFrameworkPath],
+      platform: 'iOS',
+      packagedHint:
+          'In a packaged Flutter iOS app, `$_darwinFrameworkName.framework` should be embedded automatically by Swift Package Manager or CocoaPods.',
+      devHint: 'If the app links the engine statically instead, ensure its symbols are exported from the main executable.',
+      processFallback: true,
+    );
   }
 
   if (Platform.isMacOS) {
     return _tryOpenCandidates(
-      _desktopCandidates('lib$_libName.dylib', const [
-        'macos',
-        'libs',
-        'libironpress.dylib',
+      _desktopCandidates(_darwinFrameworkPath, const [
+        'darwin',
+        'ironpress',
+        'Frameworks',
+        '$_darwinFrameworkName.xcframework',
+        'macos-arm64_x86_64',
+        _darwinFrameworkPath,
       ]),
       platform: 'macOS',
-      packagedHint: 'In a packaged Flutter macOS app, `libironpress.dylib` should be bundled automatically.',
-      devHint: 'When running directly from this package checkout, ensure the repo `macos/libs` directory is available from the current working directory or `DYLD_LIBRARY_PATH`.',
+      packagedHint:
+          'In a packaged Flutter macOS app, `$_darwinFrameworkName.framework` should be embedded automatically by Swift Package Manager or CocoaPods.',
+      devHint: 'When running directly from this package checkout, ensure the repo `darwin/ironpress/Frameworks` directory is reachable from the current working directory or `DYLD_FRAMEWORK_PATH`.',
+      processFallback: true,
     );
   }
 
@@ -92,6 +119,7 @@ DynamicLibrary _tryOpenCandidates(
   required String platform,
   required String packagedHint,
   required String devHint,
+  bool processFallback = false,
 }) {
   final errors = <String>[];
   for (final candidate in candidates) {
@@ -100,6 +128,16 @@ DynamicLibrary _tryOpenCandidates(
     } catch (error) {
       errors.add('  - $candidate: $error');
     }
+  }
+
+  if (processFallback) {
+    // Legacy integrations (e.g. a statically linked engine) expose the
+    // symbols from the host process instead of a separate framework.
+    final process = DynamicLibrary.process();
+    if (process.providesSymbol(_probeSymbol)) {
+      return process;
+    }
+    errors.add('  - <process>: symbol `$_probeSymbol` not found');
   }
 
   throw StateError(

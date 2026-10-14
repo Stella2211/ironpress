@@ -4,7 +4,7 @@ Complete API documentation for the `ironpress` Flutter plugin.
 
 > For quick-start examples, see the main [README](README.md).
 >
-> Desktop note: packaged Flutter desktop apps should load the bundled native library by name. When running directly from this package checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `macos/libs` directories.
+> Loading note: packaged Flutter apps load the bundled native library by name (`ironpress_native.framework/ironpress_native` on iOS and macOS, embedded via Swift Package Manager or CocoaPods). When running directly from this package checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `darwin/ironpress/Frameworks` directories.
 
 ---
 

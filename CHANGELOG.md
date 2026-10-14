@@ -1,5 +1,17 @@
 ## Unreleased
 
+### Swift Package Manager support
+
+- Adds Swift Package Manager support for iOS and macOS via a shared `darwin/ironpress/Package.swift` (`sharedDarwinSource: true`). CocoaPods remains supported through `darwin/ironpress.podspec`.
+- iOS and macOS now ship a single dynamic `ironpress_native.xcframework` (iOS device arm64, iOS simulator arm64 + x86_64, macOS universal) used by both integrations, replacing the static iOS xcframework and `macos/libs/libironpress.dylib`. Frameworks carry an `Info.plist` with matching minimum OS versions, `@rpath` install names, a privacy manifest, and an ad-hoc signature.
+- The Dart loader opens `ironpress_native.framework/ironpress_native` on iOS and macOS, falling back to `DynamicLibrary.process()` only when the engine symbols are present there.
+- `scripts/build.sh apple` builds the xcframework locally.
+
+### Breaking changes
+
+- Minimum deployment targets are now iOS 15.0 and macOS 12.0, matching Flutter 3.47. Apps already on Flutter 3.47 are unaffected.
+- The iOS/macOS native layout moved from `ios/` and `macos/` to `darwin/`. Run `flutter clean` (or `pod install`) after upgrading so stale CocoaPods integration is refreshed.
+
 ### Toolchain and dependency upgrades
 
 - Builds packaged native libraries with Rust 1.99.0 and Android NDK r30 (30.0.16248370).

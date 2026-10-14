@@ -13,14 +13,10 @@ scripts/
 .claude/
 .qoder/
 
-# iOS build artifacts (but keep Frameworks/ and podspec)
-ios/.symlinks/
-ios/Pods/
-ios/Flutter/
-
-# macOS build artifacts (but keep libs/ and podspec)
-macos/Flutter/
-macos/Pods/
+# Darwin (iOS/macOS) build artifacts (keep darwin/ironpress.podspec,
+# darwin/ironpress/Package.swift, Sources/ and Frameworks/)
+darwin/ironpress/.build/
+darwin/ironpress/.swiftpm/
 
 # Assets (logo etc.) - referenced via raw GitHub URL
 asset/

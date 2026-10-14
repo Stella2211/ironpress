@@ -90,7 +90,7 @@ jobs:
           name: linux-x64
           path: rust/target/release/libironpress.so
 
-  build-macos:
+  build-apple:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -98,78 +98,25 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Build macOS universal binary
-        working-directory: rust
-        run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
-          lipo -create \
-            target/aarch64-apple-darwin/release/libironpress.dylib \
-            target/x86_64-apple-darwin/release/libironpress.dylib \
-            -output target/release/libironpress.dylib
+      # Builds dynamic frameworks for iOS device, iOS simulator (arm64 +
+      # x86_64) and macOS (universal), with @rpath install names, Info.plist
+      # and ad-hoc signatures, and wraps them into one xcframework shared by
+      # Swift Package Manager and CocoaPods.
+      - name: Build xcframework
+        run: bash scripts/build.sh apple
 
-      - name: Fix install name and re-sign
-        working-directory: rust
-        run: |
-          # Prebuilt binaries are committed to the repo and consumed from an
-          # arbitrary checkout path, so the id must not point at the CI
-          # runner's build path. @rpath lets the linking app's rpath
-          # (e.g. @executable_path/../Frameworks) resolve it at runtime.
-          install_name_tool -id @rpath/libironpress.dylib target/release/libironpress.dylib
-          codesign -f -s - target/release/libironpress.dylib
-          otool -D target/release/libironpress.dylib
+      # The macOS framework is a versioned bundle that relies on symlinks,
+      # which upload-artifact does not preserve. Ship it as a tarball.
+      - name: Archive xcframework
+        run: tar -C darwin/ironpress/Frameworks -czf ironpress_native.xcframework.tar.gz ironpress_native.xcframework
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: macos-universal
-          path: rust/target/release/libironpress.dylib
-
-  build-ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-
-      - name: Build iOS libraries
-        working-directory: rust
-        env:
-          IPHONEOS_DEPLOYMENT_TARGET: '13.0'
-        run: |
-          cargo build --release --target aarch64-apple-ios
-          cargo build --release --target aarch64-apple-ios-sim
-          cargo build --release --target x86_64-apple-ios
-
-      - name: Create xcframework
-        working-directory: rust
-        run: |
-          # Simulator fat library. CocoaPods' xcframework validator rejects
-          # slices whose binary basenames differ (it looks for a single
-          # consistent library name across all AvailableLibraries entries),
-          # so keep the simulator slice's file named identically to the
-          # device slice by placing it in its own directory.
-          mkdir -p target/ios-sim-fat
-          lipo -create \
-            target/aarch64-apple-ios-sim/release/libironpress.a \
-            target/x86_64-apple-ios/release/libironpress.a \
-            -output target/ios-sim-fat/libironpress.a
-
-          xcodebuild -create-xcframework \
-            -library target/aarch64-apple-ios/release/libironpress.a \
-            -library target/ios-sim-fat/libironpress.a \
-            -output target/release/ironpress.xcframework
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ios-xcframework
-          path: rust/target/release/ironpress.xcframework
+          name: apple-xcframework
+          path: ironpress_native.xcframework.tar.gz
 
   rust-tests:
     runs-on: ubuntu-latest
@@ -187,7 +134,7 @@ jobs:
         run: cargo test
 
   package:
-    needs: [build-android, build-windows, build-linux, build-macos, build-ios, rust-tests]
+    needs: [build-android, build-windows, build-linux, build-apple, rust-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -228,15 +175,11 @@ jobs:
           mkdir -p linux/libs
           cp artifacts/linux-x64/libironpress.so linux/libs/
 
-      - name: Assemble macOS .dylib
+      - name: Assemble Apple xcframework
         run: |
-          mkdir -p macos/libs
-          cp artifacts/macos-universal/libironpress.dylib macos/libs/
-
-      - name: Assemble iOS xcframework
-        run: |
-          mkdir -p ios/Frameworks
-          cp -r artifacts/ios-xcframework ios/Frameworks/ironpress.xcframework
+          rm -rf darwin/ironpress/Frameworks/ironpress_native.xcframework
+          mkdir -p darwin/ironpress/Frameworks
+          tar -C darwin/ironpress/Frameworks -xzf artifacts/apple-xcframework/ironpress_native.xcframework.tar.gz
 
       - name: Verify structure
         run: |
@@ -249,11 +192,8 @@ jobs:
           echo "=== Linux ==="
           find linux/libs -type f -exec ls -lh {} \;
           echo ""
-          echo "=== macOS ==="
-          find macos/libs -type f -exec ls -lh {} \;
-          echo ""
-          echo "=== iOS ==="
-          find ios/Frameworks -type f -exec ls -lh {} \;
+          echo "=== iOS / macOS ==="
+          find darwin/ironpress/Frameworks -type f -exec ls -lh {} \;
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2.23.0
@@ -279,8 +219,7 @@ jobs:
             android/src/main/jniLibs/ \
             windows/libs/ \
             linux/libs/ \
-            macos/libs/ \
-            ios/Frameworks/
+            darwin/ironpress/Frameworks/
 
           # Only commit if there are changes
           if git diff --cached --quiet; then
@@ -291,7 +230,7 @@ jobs:
 
           Built from ${GITHUB_SHA::8} via CI.
           Platforms: Android (arm64-v8a, armeabi-v7a, x86_64, x86),
-          Windows (x64), Linux (x64), macOS (universal), iOS (xcframework)"
+          Windows (x64), Linux (x64), iOS + macOS (xcframework)"
 
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
@@ -324,11 +263,10 @@ jobs:
             android/build.gradle
             android/src/main/AndroidManifest.xml
             android/src/main/jniLibs/
+            darwin/
             example/
-            ios/
             lib/
             linux/
-            macos/
             pubspec.yaml
             rust/
             test/

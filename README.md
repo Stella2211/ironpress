@@ -24,6 +24,7 @@
 > - Fixed a launch-blocking bug where the prebuilt macOS dylib kept the CI build machine's absolute `install_name` instead of `@rpath/libironpress.dylib`.
 > - Migrated the lossy WebP encoder from the unmaintained `webp` crate (libwebp 1.3.1) to `webpx` (libwebp 1.6.x).
 > - Added an install_name normalization step to the CI build workflow so future prebuilt macOS binaries stay relocatable.
+> - Added Swift Package Manager support for iOS and macOS (CocoaPods remains supported). Both integrations embed the same prebuilt dynamic `ironpress_native.xcframework`.
 
 ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwebp, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call; batch work is orchestrated chunk-by-chunk in Dart and each chunk is processed natively, which keeps progress and cancellation deterministic. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
 
@@ -47,14 +48,16 @@ ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwe
 | Platform | Architectures | Status |
 |---|---|---|
 | Android | arm64, armv7, x86_64, x86 | Prebuilt |
-| iOS | arm64 (device + simulator) | Prebuilt |
+| iOS | arm64 (device), arm64 + x86_64 (simulator) | Prebuilt |
 | Windows | x86_64 | Prebuilt |
 | macOS | arm64, x86_64 (universal) | Prebuilt |
 | Linux | x86_64 | Prebuilt |
 
 All platforms ship with precompiled native libraries. No Rust toolchain is required for normal package consumers. Web is not supported (dart:ffi is unavailable on Flutter Web).
 
-For desktop Flutter apps, the packaged native library is expected to be bundled automatically by the plugin. When running tests or examples directly from this package checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `macos/libs` directories before failing.
+On iOS and macOS the plugin supports both Swift Package Manager and CocoaPods; either integration embeds the prebuilt `ironpress_native.framework` (from `darwin/ironpress/Frameworks/ironpress_native.xcframework`) into the app. Minimum deployment targets are iOS 15.0 and macOS 12.0, matching Flutter itself.
+
+For desktop Flutter apps, the packaged native library is expected to be bundled automatically by the plugin. When running tests or examples directly from this package checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `darwin/ironpress/Frameworks` directories before failing.
 
 ## Getting Started
 
@@ -189,15 +192,18 @@ final result = await Ironpress.compressFile(
 
 `keepMetadata: true` preserves EXIF data for JPEG-to-JPEG output. When converting to PNG or WebP, metadata is silently dropped. The flag is always safe to pass.
 
-### Desktop Loading
+### Native Library Loading
 
-In packaged Flutter desktop apps, the native library should be bundled automatically by the plugin and loaded by name:
+In packaged Flutter apps, the native library is bundled automatically by the plugin and loaded by name:
 
+- Android: `libironpress.so`
 - Windows: `ironpress.dll`
 - Linux: `libironpress.so`
-- macOS: `libironpress.dylib`
+- iOS / macOS: `ironpress_native.framework/ironpress_native` (embedded by Swift Package Manager or CocoaPods)
 
-When running this package directly from a checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `macos/libs` directories. If you are rebuilding the native code locally, update those packaged desktop libraries or point the platform loader (`PATH`, `LD_LIBRARY_PATH`, or `DYLD_LIBRARY_PATH`) at your rebuilt output.
+When running this package directly from a checkout, ironpress also probes the repo `windows/libs`, `linux/libs`, and `darwin/ironpress/Frameworks/ironpress_native.xcframework/macos-arm64_x86_64` directories. If you are rebuilding the native code locally, regenerate the packaged libraries (`scripts/build.sh apple` for iOS/macOS) or point the platform loader (`PATH`, `LD_LIBRARY_PATH`, or `DYLD_FRAMEWORK_PATH`) at your rebuilt output.
+
+> The macOS framework inside the xcframework is a versioned bundle that relies on symlinks. Consume this fork via a git or path dependency; `dart pub publish` archives dereference symlinks, which would make the macOS framework unsignable.
 
 ### Diagnostics
 
