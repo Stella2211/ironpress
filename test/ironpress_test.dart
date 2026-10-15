@@ -73,6 +73,15 @@ void main() {
       );
     });
 
+    test('compressBatch throws on negative memoryBudgetBytes', () {
+      expect(
+        () => Ironpress.compressBatch([
+          CompressInput(data: Uint8List.fromList([1])),
+        ], memoryBudgetBytes: -1),
+        throwsArgumentError,
+      );
+    });
+
     test('compressBatch throws on zero chunkSize', () {
       expect(
         () => Ironpress.compressBatch([

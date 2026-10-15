@@ -15,6 +15,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ironpress/ironpress.dart';
+import 'package:ironpress/src/worker_pool.dart';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -396,6 +397,109 @@ Uint8List _jpegWithExif() {
   ]);
 }
 
+/// CRC-32 (PNG chunk checksum).
+int _crc32(List<int> bytes) {
+  var crc = 0xFFFFFFFF;
+  for (final b in bytes) {
+    crc ^= b;
+    for (var i = 0; i < 8; i++) {
+      crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+List<int> _be32(int v) => [
+  (v >> 24) & 0xFF,
+  (v >> 16) & 0xFF,
+  (v >> 8) & 0xFF,
+  v & 0xFF,
+];
+
+List<int> _pngChunk(String type, List<int> data) {
+  final body = [...type.codeUnits, ...data];
+  return [..._be32(data.length), ...body, ..._be32(_crc32(body))];
+}
+
+/// Little-endian TIFF/EXIF block holding only an Orientation tag.
+List<int> _exifOrientation(int orientation) => [
+  0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // II*, IFD0 at 8
+  0x01, 0x00, // one entry
+  0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, // 0x0112 SHORT x1
+  orientation, 0x00, 0x00, 0x00, // value
+  0x00, 0x00, 0x00, 0x00, // no next IFD
+];
+
+/// 4×2 RGB PNG whose eXIf chunk declares [orientation].
+Uint8List _orientedPng(int orientation) {
+  const width = 4, height = 2;
+  final raw = <int>[];
+  for (var y = 0; y < height; y++) {
+    raw.add(0); // filter: none
+    for (var x = 0; x < width; x++) {
+      raw.addAll([x * 60, y * 120, 200]);
+    }
+  }
+  return Uint8List.fromList([
+    0x89,
+    0x50,
+    0x4E,
+    0x47,
+    0x0D,
+    0x0A,
+    0x1A,
+    0x0A,
+    ..._pngChunk('IHDR', [..._be32(width), ..._be32(height), 8, 2, 0, 0, 0]),
+    ..._pngChunk('eXIf', _exifOrientation(orientation)),
+    ..._pngChunk('IDAT', ZLibCodec().encode(raw)),
+    ..._pngChunk('IEND', const []),
+  ]);
+}
+
+/// Insert an APP1/Exif segment declaring [orientation] after the SOI.
+Uint8List _withJpegOrientation(Uint8List jpeg, int orientation) {
+  final tiff = _exifOrientation(orientation);
+  final length = 2 + 6 + tiff.length;
+  return Uint8List.fromList([
+    ...jpeg.sublist(0, 2),
+    0xFF,
+    0xE1,
+    (length >> 8) & 0xFF,
+    length & 0xFF,
+    ...'Exif\x00\x00'.codeUnits,
+    ...tiff,
+    ...jpeg.sublist(2),
+  ]);
+}
+
+/// [size]×[size] RGB PNG of pseudo-random noise: slow enough to encode
+/// (tens of ms as PNG output) for progress/cancellation tests, and with a
+/// large PNG output for buffer-lifetime tests.
+Uint8List _noisyPng(int size, {int seed = 1}) {
+  var state = seed;
+  final raw = <int>[];
+  for (var y = 0; y < size; y++) {
+    raw.add(0); // filter: none
+    for (var x = 0; x < size * 3; x++) {
+      state = (state * 1103515245 + 12345) & 0x7FFFFFFF;
+      raw.add((state >> 16) & 0xFF);
+    }
+  }
+  return Uint8List.fromList([
+    0x89,
+    0x50,
+    0x4E,
+    0x47,
+    0x0D,
+    0x0A,
+    0x1A,
+    0x0A,
+    ..._pngChunk('IHDR', [..._be32(size), ..._be32(size), 8, 2, 0, 0, 0]),
+    ..._pngChunk('IDAT', ZLibCodec(level: 1).encode(raw)),
+    ..._pngChunk('IEND', const []),
+  ]);
+}
+
 // ─── Helper ──────────────────────────────────────────────────────────────────
 
 const bool _nativeRequired = bool.fromEnvironment('IRONPRESS_NATIVE_REQUIRED');
@@ -756,16 +860,19 @@ void main() {
       );
 
       test('cancellation with progress preserves partial results', () async {
+        // Items must outlast the ~16 ms progress poll for the cancel issued
+        // from the callback to land while the batch is still running.
         const total = 20;
+        final input = _noisyPng(384);
         final token = CancellationToken();
         final batch = await _runWithNative(
           () => Ironpress.compressBatch(
-            List.generate(total, (_) => CompressInput(data: _syntheticJpeg())),
-            quality: 80,
-            chunkSize: 1,
+            List.generate(total, (_) => CompressInput(data: input)),
+            format: CompressFormat.png,
+            threadCount: 1,
             cancellationToken: token,
             onProgress: (completed, _) {
-              if (completed == 1) {
+              if (completed >= 1) {
                 token.cancel();
               }
             },
@@ -777,6 +884,7 @@ void main() {
 
         expect(batch.results.length, greaterThan(0));
         expect(batch.results.length, lessThan(total));
+        expect(batch.results.every((r) => r.isSuccess), isTrue);
       });
 
       test(
@@ -939,6 +1047,44 @@ void main() {
       });
     });
 
+    group('Integration - EXIF orientation', () {
+      test('orientation is applied and reset in kept EXIF', () async {
+        final png = _orientedPng(6);
+        final rotated = await _runWithNative(
+          () => Ironpress.compressBytes(png, format: CompressFormat.png),
+        );
+        if (rotated == null) {
+          return;
+        }
+
+        // Probe reports stored dimensions; the output is display-oriented.
+        final probe = await Ironpress.probeBytes(png);
+        expect([probe.width, probe.height], [4, 2]);
+        expect([rotated.width, rotated.height], [2, 4]);
+
+        final jpeg = await Ironpress.compressBytes(
+          _orientedPng(1),
+          format: CompressFormat.jpeg,
+          quality: 90,
+        );
+        final kept = await Ironpress.compressBytes(
+          _withJpegOrientation(jpeg.data!, 8),
+          format: CompressFormat.jpeg,
+          keepMetadata: true,
+        );
+        expect([kept.width, kept.height], [2, 4]);
+        expect((await Ironpress.probeBytes(kept.data!)).hasExif, isTrue);
+
+        // Re-compressing the output must not rotate it again.
+        final again = await Ironpress.compressBytes(
+          kept.data!,
+          format: CompressFormat.jpeg,
+          keepMetadata: true,
+        );
+        expect([again.width, again.height], [2, 4]);
+      });
+    });
+
     test('nativeVersion matches the packaged native release', () {
       if (!_nativeLibraryAvailable()) {
         return;
@@ -946,6 +1092,370 @@ void main() {
 
       final version = Ironpress.nativeVersion;
       expect(version, '0.3.0');
+    });
+  });
+
+  group('Integration - worker pool', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('ironpress_pool_');
+    });
+
+    tearDown(() {
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('concurrent single calls all succeed with ordered results', () async {
+      final input = File('${tempDir.path}/input.jpg')
+        ..writeAsBytesSync(_syntheticJpeg());
+      final results = await _runWithNative(
+        () => Future.wait<Object>([
+          for (var i = 0; i < 12; i++) ...[
+            Ironpress.compressBytes(_syntheticJpeg(), quality: 50 + i),
+            Ironpress.compressFile(input.path, quality: 50 + i),
+            Ironpress.probeBytes(_syntheticPng()),
+          ],
+        ]),
+      );
+      if (results == null) {
+        return;
+      }
+
+      expect(results.length, 36);
+      for (var i = 0; i < results.length; i++) {
+        final result = results[i];
+        if (i % 3 == 2) {
+          expect((result as ImageProbe).format, ImageFormat.png);
+        } else {
+          expect((result as CompressResult).isSuccess, isTrue);
+          expect(result.data, isNotNull);
+        }
+      }
+    });
+
+    test('native errors keep their CompressException type', () async {
+      if (!_nativeLibraryAvailable()) {
+        return;
+      }
+      await expectLater(
+        Ironpress.compressBytes(Uint8List.fromList([1, 2, 3, 4])),
+        throwsA(isA<CompressException>()),
+      );
+      await expectLater(
+        Ironpress.probeFile('${tempDir.path}/missing.jpg'),
+        throwsA(isA<CompressException>()),
+      );
+      await expectLater(
+        Ironpress.benchmarkBytes(Uint8List.fromList([9, 9, 9])),
+        throwsA(isA<CompressException>()),
+      );
+      // Workers keep serving requests after errors.
+      final result = await Ironpress.compressBytes(_syntheticJpeg());
+      expect(result.isSuccess, isTrue);
+    });
+
+    test('path-only batch without events runs as one native call', () async {
+      final input = File('${tempDir.path}/input.jpg')
+        ..writeAsBytesSync(_syntheticJpeg());
+      final batch = await _runWithNative(
+        () => Ironpress.compressBatch(
+          [
+            for (var i = 0; i < 9; i++)
+              CompressInput(
+                path: i == 4 ? '${tempDir.path}/missing.jpg' : input.path,
+              ),
+          ],
+          quality: 80,
+          chunkSize: 2,
+        ),
+      );
+      if (batch == null) {
+        return;
+      }
+
+      expect(batch.results.length, 9);
+      for (var i = 0; i < 9; i++) {
+        expect(batch.results[i].isSuccess, i != 4, reason: 'item $i');
+      }
+    });
+
+    for (final chunked in [false, true]) {
+      test(
+        'byte inputs keep order (${chunked ? 'chunked' : 'bulk'})',
+        () async {
+          final input = File('${tempDir.path}/input.png')
+            ..writeAsBytesSync(_syntheticPng());
+          final progress = <int>[];
+          final batch = await _runWithNative(
+            () => Ironpress.compressBatch(
+              [
+                for (var i = 0; i < 10; i++)
+                  switch (i % 4) {
+                    0 => CompressInput(data: _syntheticJpeg()),
+                    1 => CompressInput(path: input.path),
+                    2 => CompressInput(data: Uint8List.fromList([1, 2, 3])),
+                    _ => CompressInput(data: _syntheticPng()),
+                  },
+              ],
+              format: CompressFormat.png,
+              chunkSize: 3,
+              // A 1-byte budget forces the chunk-by-chunk copy of byte inputs
+              // (and runs the images one at a time).
+              memoryBudgetBytes: chunked ? 1 : null,
+              onProgress: (completed, total) {
+                expect(total, 10);
+                progress.add(completed);
+              },
+            ),
+          );
+          if (batch == null) {
+            return;
+          }
+
+          expect(progress, isNotEmpty);
+          for (var i = 1; i < progress.length; i++) {
+            expect(progress[i], greaterThan(progress[i - 1]));
+          }
+          expect(progress.last, 10);
+          expect(batch.results.length, 10);
+          for (var i = 0; i < 10; i++) {
+            expect(batch.results[i].isSuccess, i % 4 != 2, reason: 'item $i');
+          }
+        },
+      );
+    }
+
+    test('streamed byte inputs without events complete', () async {
+      final batch = await _runWithNative(
+        () => Ironpress.compressBatch([
+          for (var i = 0; i < 7; i++) CompressInput(data: _syntheticJpeg()),
+          CompressInput(data: Uint8List(0)),
+        ], chunkSize: 2),
+      );
+      if (batch == null) {
+        return;
+      }
+
+      expect(batch.results.length, 8);
+      expect(batch.results.take(7).every((r) => r.isSuccess), isTrue);
+      expect(batch.results.last.isSuccess, isFalse);
+    });
+
+    test('cancelling a queued batch yields no results', () async {
+      if (!_nativeLibraryAvailable()) {
+        return;
+      }
+      final previous = WorkerPool.shared;
+      WorkerPool.shared = WorkerPool(maxWorkers: 1);
+      try {
+        final blocker = Ironpress.benchmarkBytes(_syntheticJpeg());
+        final token = CancellationToken();
+        final future = Ironpress.compressBatch(
+          List.generate(4, (_) => CompressInput(data: _syntheticJpeg())),
+          chunkSize: 1,
+          cancellationToken: token,
+        );
+        token.cancel();
+        final batch = await future;
+        await blocker;
+        expect(batch.results, isEmpty);
+      } finally {
+        WorkerPool.shared = previous;
+      }
+    });
+
+    test('single-call path batch reports live progress and cancels', () async {
+      final input = File('${tempDir.path}/noise.png')
+        ..writeAsBytesSync(_noisyPng(384));
+      const total = 16;
+      final progress = <int>[];
+      final token = CancellationToken();
+      final batch = await _runWithNative(
+        () => Ironpress.compressBatch(
+          List.generate(total, (_) => CompressInput(path: input.path)),
+          format: CompressFormat.png,
+          threadCount: 1,
+          // chunkSize no longer splits path batches: progress and
+          // cancellation work inside the single native call.
+          chunkSize: 1,
+          cancellationToken: token,
+          onProgress: (completed, _) {
+            progress.add(completed);
+            if (completed >= 2) {
+              token.cancel();
+            }
+          },
+        ),
+      );
+      if (batch == null) {
+        return;
+      }
+
+      expect(batch.results.length, inInclusiveRange(2, total - 1));
+      expect(batch.results.every((r) => r.isSuccess), isTrue);
+      for (var i = 1; i < progress.length; i++) {
+        expect(progress[i], greaterThan(progress[i - 1]));
+      }
+      expect(progress.last, batch.results.length);
+    });
+
+    test('progress ends at total without cancellation', () async {
+      final input = File('${tempDir.path}/noise.png')
+        ..writeAsBytesSync(_noisyPng(256));
+      final progress = <int>[];
+      final batch = await _runWithNative(
+        () => Ironpress.compressBatch(
+          List.generate(6, (_) => CompressInput(path: input.path)),
+          format: CompressFormat.png,
+          threadCount: 2,
+          onProgress: (completed, total) {
+            expect(total, 6);
+            progress.add(completed);
+          },
+        ),
+      );
+      if (batch == null) {
+        return;
+      }
+
+      expect(batch.results.length, 6);
+      expect(progress.last, 6);
+      expect(progress.where((p) => p == 6).length, 1);
+    });
+
+    test('memoryBudgetBytes is accepted and does not change results', () async {
+      final inputs = [
+        for (var i = 0; i < 4; i++) CompressInput(data: _noisyPng(64, seed: i)),
+      ];
+      final unbounded = await _runWithNative(
+        () => Ironpress.compressBatch(inputs, format: CompressFormat.png),
+      );
+      if (unbounded == null) {
+        return;
+      }
+      for (final budget in [1, 0, 64 * 1024 * 1024]) {
+        final batch = await Ironpress.compressBatch(
+          inputs,
+          format: CompressFormat.png,
+          memoryBudgetBytes: budget,
+        );
+        expect(batch.results.length, 4);
+        for (var i = 0; i < 4; i++) {
+          expect(batch.results[i].data, unbounded.results[i].data);
+        }
+      }
+    });
+
+    test('zero-copy outputs match the file output byte for byte', () async {
+      final png = _noisyPng(96);
+      final outPath = '${tempDir.path}/out.png';
+      final inPath = '${tempDir.path}/in.png';
+      File(inPath).writeAsBytesSync(png);
+      final bytes = await _runWithNative(
+        () => Ironpress.compressBytes(png, format: CompressFormat.png),
+      );
+      if (bytes == null) {
+        return;
+      }
+      await Ironpress.compressFileToFile(
+        inPath,
+        outPath,
+        format: CompressFormat.png,
+      );
+      final expected = File(outPath).readAsBytesSync();
+      expect(bytes.data, expected);
+      expect(bytes.compressedSize, expected.length);
+
+      final fromFile = await Ironpress.compressFile(
+        inPath,
+        format: CompressFormat.png,
+      );
+      expect(fromFile.data, expected);
+
+      final batch = await Ironpress.compressBatch([
+        CompressInput(data: png),
+        CompressInput(path: inPath),
+      ], format: CompressFormat.png);
+      expect(batch.results[0].data, expected);
+      expect(batch.results[1].data, expected);
+      // The external list is a normal, readable Uint8List.
+      expect(batch.results[0].data!.sublist(1, 4), 'PNG'.codeUnits);
+    });
+
+    test('released outputs do not accumulate native memory', () async {
+      if (!_nativeLibraryAvailable()) {
+        return;
+      }
+      // ~0.8 MB of PNG output per call; 400 calls would leak ~300 MB.
+      final png = _noisyPng(512);
+      Future<void> churn(int rounds) async {
+        for (var i = 0; i < rounds; i++) {
+          final result = await Ironpress.compressBytes(
+            png,
+            format: CompressFormat.png,
+            png: const PngOptions(optimizationLevel: 0),
+          );
+          expect(result.compressedSize, greaterThan(500 * 1024));
+        }
+      }
+
+      await churn(40); // warm up allocator, workers and caches
+      final before = ProcessInfo.currentRss;
+      await churn(400);
+      final growth = ProcessInfo.currentRss - before;
+      expect(
+        growth,
+        lessThan(100 * 1024 * 1024),
+        reason: 'RSS grew by ${growth ~/ (1024 * 1024)} MB',
+      );
+    });
+
+    test('probe reports the EXIF orientation', () async {
+      final png6 = _orientedPng(6);
+      final probe = await _runWithNative(() => Ironpress.probeBytes(png6));
+      if (probe == null) {
+        return;
+      }
+      expect(probe.orientation, 6);
+      expect([probe.width, probe.height], [4, 2]); // stored dimensions
+
+      final file = File('${tempDir.path}/o6.png')..writeAsBytesSync(png6);
+      expect((await Ironpress.probeFile(file.path)).orientation, 6);
+
+      final jpeg = await Ironpress.compressBytes(
+        _orientedPng(1),
+        format: CompressFormat.jpeg,
+      );
+      final jpeg8 = _withJpegOrientation(jpeg.data!, 8);
+      expect((await Ironpress.probeBytes(jpeg8)).orientation, 8);
+      expect((await Ironpress.probeBytes(_syntheticJpeg())).orientation, 1);
+      expect((await Ironpress.probeBytes(_syntheticPng())).orientation, 1);
+    });
+
+    test('idle workers exit and are recreated on the next call', () async {
+      if (!_nativeLibraryAvailable()) {
+        return;
+      }
+      final previous = WorkerPool.shared;
+      final pool = WorkerPool(idleTimeout: const Duration(milliseconds: 100));
+      WorkerPool.shared = pool;
+      try {
+        await Ironpress.compressBytes(_syntheticJpeg());
+        expect(pool.debugWorkerCount, 1);
+
+        final deadline = DateTime.now().add(const Duration(seconds: 10));
+        while (pool.debugWorkerCount > 0 && DateTime.now().isBefore(deadline)) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+        expect(pool.debugWorkerCount, 0);
+
+        final result = await Ironpress.compressBytes(_syntheticJpeg());
+        expect(result.isSuccess, isTrue);
+        expect(pool.debugSpawnCount, 2);
+      } finally {
+        WorkerPool.shared = previous;
+      }
     });
   });
 }

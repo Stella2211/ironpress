@@ -188,7 +188,9 @@ final webpResult = await Ironpress.compressBytes(
 
 Batch compress multiple images using Rust's rayon thread pool.
 
-Batch work is orchestrated chunk-by-chunk. Each chunk is processed natively, progress is reported after each completed chunk, and cancellation is observed before the next chunk starts. Already-completed results are preserved when cancellation is requested.
+The whole batch normally runs in a single native call, so no thread idles at chunk boundaries — also with `onProgress` and `cancellationToken`. Progress and cancellation go through a small shared native block: the engine increments a completed-items counter that the calling isolate polls (about every 16 ms), and cancelling sets a flag the engine checks before starting each image. Images that have not started are skipped; running images finish and their results are returned.
+
+In-memory (`data`) inputs are copied to native memory: all at once when the batch starts if their total size is at most a quarter of the memory budget (128 MB by default), otherwise `chunkSize` items at a time (plus one chunk of prefetch), with one native call per chunk. Do not modify the input buffers until the returned future completes.
 
 ```dart
 static Future<BatchCompressResult> compressBatch(
@@ -206,6 +208,7 @@ static Future<BatchCompressResult> compressBatch(
   PngOptions png = const PngOptions(),
   int threadCount = 0,
   int chunkSize = 8,
+  int? memoryBudgetBytes,
   void Function(int completed, int total)? onProgress,
   CancellationToken? cancellationToken,
 })
@@ -216,18 +219,22 @@ static Future<BatchCompressResult> compressBatch(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `threadCount` | `int` | `0` | Number of Rayon threads. `0` = auto (cores − 2, leaving room for Flutter UI). |
-| `chunkSize` | `int` | `8` | Images decoded simultaneously per chunk. Controls peak memory (~36 MB per 4K image). Between chunks, pixel buffers are freed. |
-| `onProgress` | `Function?` | `null` | Called on the main thread with `(completed, total)`. Safe to call `setState` directly. |
-| `cancellationToken` | `CancellationToken?` | `null` | Cancel between chunks. Returns partial results for completed chunks. |
+| `chunkSize` | `int` | `8` | Only used when the in-memory (`data`) inputs total more than a quarter of the memory budget: they are then copied to native memory and compressed this many at a time, bounding the extra native memory to about two chunks of input bytes. Path inputs and smaller byte batches run in one native call and ignore it. Concurrency and decode memory are bounded by `threadCount` and `memoryBudgetBytes` instead. |
+| `memoryBudgetBytes` | `int?` | `null` (512 MB) | Budget for the estimated peak memory of the images being compressed at once. `null` or `0` = default (512 MB). Images start in order while the estimate of all running batch images plus the next one fits; a single image larger than the budget still runs, alone. See *Memory budget* below. |
+| `onProgress` | `Function?` | `null` | Called on the calling isolate with `(completed, total)`. Safe to call `setState` directly. |
+| `cancellationToken` | `CancellationToken?` | `null` | Stops starting new images. Returns the results of the images that were processed (a prefix of `inputs`, in order). |
 
-Validation note: `threadCount` must be `>= 0`, `chunkSize` must be `> 0`, and numeric resize/size arguments must be positive and fit the native `u32` ABI.
+Validation note: `threadCount` must be `>= 0`, `chunkSize` must be `> 0`, `memoryBudgetBytes` must be `>= 0` (or `null`), and numeric resize/size arguments must be positive and fit the native `u32` ABI.
 
-Behavior note: `onProgress` fires after each completed chunk and emits the final `(total, total)` callback exactly once. `CancellationToken.cancel()` stops scheduling later chunks after the current chunk finishes.
+Behavior note: `completed` counts finished images (successful or failed). `onProgress` is called whenever the polled count has increased — several images may finish between two calls, so not every value is reported — and never twice with the same value; it is monotonic, and the last call reports the final result count (`(total, total)` exactly once unless cancelled). `CancellationToken.cancel()` takes effect immediately: images not yet started are skipped. Cancelling before the batch has started (e.g. while it waits for a free worker) returns an empty result.
+
+**Memory budget:** each image's peak memory is estimated from its header only — the decoded size (after EXIF rotation and, for JPEG downscales, the reduced DCT-scaled decode size) plus the encoder's working set. The accounting is process-wide: an image is admitted when the estimates of *all* running batch images, from every concurrent `compressBatch` call, plus the new image fit that call's own budget. With equal budgets, concurrent batches therefore share one limit; a batch with a smaller budget waits while others keep usage high, and total usage never exceeds the largest active budget (plus at most one oversized image).
 
 **Safety guarantees:**
 - Each item is panic-safe: a corrupt image produces an error result, not a process crash.
-- `chunkSize` limits peak memory (default 8 ≈ ~288 MB for 4K photos).
+- `memoryBudgetBytes` bounds the estimated decode/encode memory of concurrently running images (default 512 MB).
 - `threadCount` defaults to `cores − 2`, keeping the UI responsive.
+- Output bytes are handed over without copying: `CompressResult.data` is backed by native memory that is freed when the list is garbage collected.
 
 **Example:**
 
@@ -399,12 +406,16 @@ const JpegOptions({
 Advanced PNG optimization options.
 
 ```dart
-const PngOptions({int optimizationLevel = 2})
+const PngOptions({
+  int optimizationLevel = 2,
+  bool limitLevelForLargeImages = true,
+})
 ```
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `optimizationLevel` | `int` | `2` | Optimization level 0–6. `0` = no optimization (fastest), `2` = good balance, `6` = maximum compression (slowest). |
+| `limitLevelForLargeImages` | `bool` | `true` | Lower levels above 2 for large images (size after any resize): up to 3.75 MP the requested level is used, above 3.75 MP at most level 4, above 12 MP at most level 2. Levels 0–2 are never changed. Reference (worst-case 12 MP image, Apple M-series): level 2 ≈ 6 s, level 4 ≈ 10.6 s, level 6 ≈ 34 s; phones are several times slower. `false` = always use `optimizationLevel` as given. |
 
 ---
 
@@ -481,7 +492,7 @@ Compression result with stats.
 | `width` | `int` | Final image width in pixels. |
 | `height` | `int` | Final image height in pixels. |
 | `qualityUsed` | `int` | Actual quality used. May differ from requested if `maxFileSize` was set. |
-| `iterations` | `int` | Number of compression iterations (1 if no `maxFileSize`). |
+| `iterations` | `int` | Number of encode attempts (encoder runs). `1` without `maxFileSize`; with `maxFileSize`, every trial encode of the target-size search, including fast PNG trial encodes. |
 | `resizedToFit` | `bool` | Whether the image was auto-resized to meet the file size target. |
 | `errorCode` | `int?` | Error code for failed batch items. `null` for success. |
 | `errorMessage` | `String?` | Error message for failed batch items. `null` for success. |
@@ -537,11 +548,12 @@ Quick image metadata from file headers — no pixel decoding.
 
 | Field | Type | Description |
 |---|---|---|
-| `width` | `int` | Image width in pixels. |
-| `height` | `int` | Image height in pixels. |
+| `width` | `int` | Image width in pixels, as stored (before EXIF orientation). |
+| `height` | `int` | Image height in pixels, as stored (before EXIF orientation). |
 | `format` | `ImageFormat` | Detected format (`jpeg`, `png`, `webp`). |
 | `fileSize` | `int` | File size in bytes. |
 | `hasExif` | `bool` | Whether EXIF metadata is present. |
+| `orientation` | `int` | EXIF orientation 1–8 (`1` when absent). Compression applies it, so the displayed/compressed image has `width` and `height` swapped when `orientation` is 5–8. |
 
 **Computed properties:**
 
@@ -605,7 +617,7 @@ q85: 620 KB (85.2%, 180ms)
 
 ### CancellationToken
 
-Token for cancelling batch compression between chunks.
+Token for cancelling a batch compression. Cancelling stops the batch from starting new images; images already being compressed finish and their results are returned.
 
 ```dart
 class CancellationToken {
@@ -657,7 +669,7 @@ class CompressException implements Exception {
 | `-2` | Invalid UTF-8 in path or empty input buffer |
 | `-3` | Failed to read input file |
 | `-4` | Failed to write output file |
-| `-5` | Input too large (exceeds 256 MB limit) |
+| `-5` | Input too large: file/buffer exceeds 256 MB, or the image exceeds 100 MP (checked from the header, before decoding) |
 | `-10` | Compression engine error (decode failure, unsupported format) |
 | `-99` | Internal panic during batch item (OOM or corrupt image — other items unaffected) |
 | `-100` | Batch isolate crashed unexpectedly |

@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:ffi';
-import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -8,18 +8,28 @@ import 'package:ffi/ffi.dart';
 import 'bindings.dart';
 import 'native_loader.dart';
 import 'options.dart';
+import 'worker_pool.dart';
 
 /// Expected ABI version — must match the Rust constant.
 /// Increment both sides when any #[repr(C)] struct layout changes.
-const int _expectedAbiVersion = 1;
+const int _expectedAbiVersion = 2;
 
-/// Error code used when the batch progress isolate crashes unexpectedly.
+/// Error code used when a batch worker isolate crashes unexpectedly.
 const int _isolateCrashCode = -100;
 
 /// Maximum value representable by native `u32` fields.
 const int _maxUint32 = 0xFFFFFFFF;
 
-const String _cancelBatchMessage = 'cancel';
+/// Default native batch memory budget (must match the Rust default).
+const int _defaultBatchMemoryBudget = 512 * 1024 * 1024;
+
+/// Byte inputs whose total size is at most this fraction of the memory
+/// budget are copied to native memory at once and compressed in one native
+/// call; larger ones are copied and compressed chunk by chunk.
+const int _bulkCopyBudgetDivisor = 4;
+
+/// How often the caller polls the shared progress counter.
+const Duration _progressPollInterval = Duration(milliseconds: 16);
 
 /// Validates quality parameters before passing them to the native engine.
 ///
@@ -124,9 +134,20 @@ void _validateCompressionArgs({
   _validatePngOptions(png);
 }
 
-void _validateBatchArgs({required int threadCount, required int chunkSize}) {
+void _validateBatchArgs({
+  required int threadCount,
+  required int chunkSize,
+  int? memoryBudgetBytes,
+}) {
   _validateNonNegativeUint32(threadCount, 'threadCount');
   _validatePositiveUint32(chunkSize, 'chunkSize');
+  if (memoryBudgetBytes != null && memoryBudgetBytes < 0) {
+    throw ArgumentError.value(
+      memoryBudgetBytes,
+      'memoryBudgetBytes',
+      'must be greater than or equal to 0',
+    );
+  }
 }
 
 void _validateBenchmarkArgs({int? maxWidth, int? maxHeight}) {
@@ -134,55 +155,95 @@ void _validateBenchmarkArgs({int? maxWidth, int? maxHeight}) {
   _validateOptionalPositiveUint32(maxHeight, 'maxHeight');
 }
 
-/// Cached bindings per isolate (each isolate has its own top-level state).
-NativeBindings? _cachedBindings;
-NativeBindings _getBindings() =>
-    _cachedBindings ??= NativeBindings.fromLibrary(loadNativeLibrary());
+// ─── Native bindings (cached once per isolate) ──────────────────────────────
 
-class _WorkerFailure {
-  const _WorkerFailure({required this.message, this.code, this.stackTrace});
+/// Bindings for the current isolate. Each worker isolate loads the library
+/// and checks the ABI once, then reuses the bindings for its lifetime.
+NativeBindings? _bindings;
 
-  final String message;
-  final int? code;
-  final String? stackTrace;
-
-  Object toException() {
-    if (code != null) {
-      return CompressException(code!, message);
-    }
-    final suffix = stackTrace == null || stackTrace!.isEmpty
-        ? ''
-        : '\n$stackTrace';
-    return StateError('$message$suffix');
+/// Returns the bindings for the current isolate, loading the native library
+/// and verifying its ABI version on first use.
+NativeBindings _nativeBindings() {
+  final cached = _bindings;
+  if (cached != null) {
+    return cached;
   }
-
-  Never rethrowAsException() {
-    throw toException();
+  final library = loadNativeLibrary();
+  // Check the ABI before resolving any other symbol: a stale library may
+  // lack newer functions, which must surface as an ABI mismatch.
+  final version = library
+      .lookupFunction<AbiVersionNative, AbiVersionDart>('ironpress_abi_version')
+      .call();
+  if (version != _expectedAbiVersion) {
+    throw StateError(
+      'Ironpress ABI version mismatch: native=$version, '
+      'expected=$_expectedAbiVersion. Rebuild the native library.',
+    );
   }
+  return _bindings = NativeBindings.fromLibrary(library);
 }
 
-class _BatchIsolateRequest {
-  const _BatchIsolateRequest({
-    required this.batchInputs,
-    required this.eventPort,
+WorkerPool get _pool => WorkerPool.shared;
+
+// ─── Settings & transferable results ────────────────────────────────────────
+
+/// Resolved compression settings (preset already applied). Sendable.
+class _CompressSettings {
+  const _CompressSettings({
     required this.quality,
-    required this.maxWidth,
-    required this.maxHeight,
-    required this.maxFileSize,
+    this.maxWidth,
+    this.maxHeight,
+    this.maxFileSize,
     required this.minQuality,
     required this.allowResize,
     required this.format,
     required this.keepMetadata,
     required this.jpeg,
     required this.png,
-    required this.threadCount,
-    required this.chunkSize,
-    required this.reportProgress,
-    required this.enableCancellation,
   });
 
-  final List<_TransferableBatchInputSpec> batchInputs;
-  final SendPort eventPort;
+  factory _CompressSettings.resolve({
+    CompressPreset? preset,
+    int? quality,
+    int? maxWidth,
+    int? maxHeight,
+    int? maxFileSize,
+    int? minQuality,
+    required bool allowResize,
+    required CompressFormat format,
+    required bool keepMetadata,
+    required JpegOptions jpeg,
+    required PngOptions png,
+  }) {
+    return _CompressSettings(
+      quality: quality ?? preset?.quality ?? 80,
+      maxWidth: maxWidth ?? preset?.maxWidth,
+      maxHeight: maxHeight ?? preset?.maxHeight,
+      maxFileSize: maxFileSize,
+      minQuality: minQuality ?? preset?.minQuality ?? 30,
+      allowResize: allowResize,
+      format: format,
+      keepMetadata: keepMetadata,
+      jpeg: jpeg,
+      png: png,
+    );
+  }
+
+  /// Settings used by the benchmark entry points.
+  factory _CompressSettings.benchmark({int? maxWidth, int? maxHeight}) {
+    return _CompressSettings(
+      quality: 80,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      minQuality: 30,
+      allowResize: true,
+      format: CompressFormat.auto,
+      keepMetadata: false,
+      jpeg: const JpegOptions(),
+      png: const PngOptions(),
+    );
+  }
+
   final int quality;
   final int? maxWidth;
   final int? maxHeight;
@@ -193,71 +254,61 @@ class _BatchIsolateRequest {
   final bool keepMetadata;
   final JpegOptions jpeg;
   final PngOptions png;
-  final int threadCount;
-  final int chunkSize;
-  final bool reportProgress;
-  final bool enableCancellation;
-}
 
-Future<void> _batchWorkerMain(_BatchIsolateRequest request) async {
-  try {
-    final result = await Ironpress._compressBatchTransferAsync(
-      request.batchInputs
-          .map((input) => input.materialize())
-          .toList(growable: false),
-      quality: request.quality,
-      maxWidth: request.maxWidth,
-      maxHeight: request.maxHeight,
-      maxFileSize: request.maxFileSize,
-      minQuality: request.minQuality,
-      allowResize: request.allowResize,
-      format: request.format,
-      keepMetadata: request.keepMetadata,
-      jpeg: request.jpeg,
-      png: request.png,
-      threadCount: request.threadCount,
-      chunkSize: request.chunkSize,
-      progressSendPort: request.reportProgress ? request.eventPort : null,
-      controlInitPort: request.enableCancellation ? request.eventPort : null,
-    );
-    request.eventPort.send(result);
-  } on CompressException catch (error, stackTrace) {
-    request.eventPort.send(
-      _WorkerFailure(
-        message: error.message,
-        code: error.code,
-        stackTrace: stackTrace.toString(),
-      ),
-    );
-  } catch (error, stackTrace) {
-    request.eventPort.send(
-      _WorkerFailure(
-        message: error.toString(),
-        stackTrace: stackTrace.toString(),
-      ),
-    );
+  Pointer<NativeCompressParams> toNative(Allocator allocator) {
+    final p = allocator<NativeCompressParams>();
+    p.ref
+      ..quality = quality.clamp(0, 100)
+      ..maxWidth = maxWidth ?? 0
+      ..maxHeight = maxHeight ?? 0
+      ..maxFileSize = maxFileSize ?? 0
+      ..minQuality = minQuality.clamp(0, 100)
+      ..allowResize = allowResize ? 1 : 0
+      ..format = format.value
+      ..keepMetadata = keepMetadata ? 1 : 0
+      ..jpegProgressive = jpeg.progressive ? 1 : 0
+      ..jpegChromaSubsampling = jpeg.chromaSubsampling.value
+      ..jpegTrellis = jpeg.trellis ? 1 : 0
+      ..pngOptimizationLevel = png.optimizationLevel.clamp(0, 6)
+      ..pngLevelUnbounded = png.limitLevelForLargeImages ? 0 : 1;
+    return p;
   }
 }
 
-class _TransferableBatchInputSpec {
-  const _TransferableBatchInputSpec({this.path, this.data, this.outputPath});
+/// A native output buffer handed from a worker to the caller isolate by
+/// address (no copy). Exactly one owner releases it: [materialize] attaches
+/// `ironpress_free_buffer` as a finalizer to the returned external
+/// [Uint8List]; [free] releases it directly.
+class _NativeOutput {
+  const _NativeOutput(this.handle, this.address, this.length, this.freeFn);
 
-  final String? path;
-  final TransferableTypedData? data;
-  final String? outputPath;
+  /// Opaque owner handle (`CompressResult.buffer`).
+  final int handle;
 
-  _BatchInputSpec materialize() {
-    return _BatchInputSpec(
-      path: path,
-      data: data?.materialize().asUint8List(),
-      outputPath: outputPath,
+  /// Address of the first output byte.
+  final int address;
+  final int length;
+
+  /// Address of `ironpress_free_buffer` (process-wide).
+  final int freeFn;
+
+  Uint8List materialize() {
+    return Pointer<Uint8>.fromAddress(address).asTypedList(
+      length,
+      finalizer: Pointer<NativeFinalizerFunction>.fromAddress(freeFn),
+      token: Pointer<Void>.fromAddress(handle),
     );
+  }
+
+  void free() {
+    Pointer<NativeFunction<FreeBufferNative>>.fromAddress(freeFn)
+        .asFunction<FreeBufferDart>()(Pointer<Void>.fromAddress(handle));
   }
 }
 
-class _TransferableCompressResult {
+class _TransferableCompressResult implements WorkerDisposable {
   const _TransferableCompressResult({
-    this.data,
+    this.output,
     required this.originalSize,
     required this.compressedSize,
     required this.width,
@@ -269,7 +320,7 @@ class _TransferableCompressResult {
     this.errorMessage,
   });
 
-  final TransferableTypedData? data;
+  final _NativeOutput? output;
   final int originalSize;
   final int compressedSize;
   final int width;
@@ -280,9 +331,11 @@ class _TransferableCompressResult {
   final int? errorCode;
   final String? errorMessage;
 
+  /// Builds the public result. Must be called at most once, on the caller
+  /// isolate: it takes ownership of the native output buffer.
   CompressResult materialize() {
     return CompressResult(
-      data: data?.materialize().asUint8List(),
+      data: output?.materialize(),
       originalSize: originalSize,
       compressedSize: compressedSize,
       width: width,
@@ -294,9 +347,12 @@ class _TransferableCompressResult {
       errorMessage: errorMessage,
     );
   }
+
+  @override
+  void disposeUndelivered() => output?.free();
 }
 
-class _TransferableBatchCompressResult {
+class _TransferableBatchCompressResult implements WorkerDisposable {
   const _TransferableBatchCompressResult({
     required this.results,
     required this.elapsedMs,
@@ -305,12 +361,664 @@ class _TransferableBatchCompressResult {
   final List<_TransferableCompressResult> results;
   final int elapsedMs;
 
+  /// See [_TransferableCompressResult.materialize].
   BatchCompressResult materialize() {
     return BatchCompressResult(
       results: results.map((result) => result.materialize()).toList(),
       elapsedMs: elapsedMs,
     );
   }
+
+  @override
+  void disposeUndelivered() {
+    for (final result in results) {
+      result.disposeUndelivered();
+    }
+  }
+}
+
+/// Worker-side guard for native outputs held across asynchronous gaps
+/// (between batch chunks): if the worker isolate dies or the task fails
+/// before the outputs are handed over, the attached [NativeFinalizer]
+/// releases them.
+final class _OutputGuard implements Finalizable {
+  _OutputGuard(this.output, this._finalizer) {
+    _finalizer.attach(
+      this,
+      Pointer<Void>.fromAddress(output.handle),
+      detach: this,
+      externalSize: output.length,
+    );
+  }
+
+  final _NativeOutput output;
+  final NativeFinalizer _finalizer;
+
+  /// Hands the output over to the caller (no automatic release anymore).
+  _NativeOutput release() {
+    _finalizer.detach(this);
+    return output;
+  }
+
+  /// Releases the output now.
+  void free() => release().free();
+}
+
+/// Per-isolate finalizer releasing native outputs.
+NativeFinalizer? _outputFinalizer;
+
+NativeFinalizer _outputFinalizerFor(NativeBindings bindings) {
+  return _outputFinalizer ??= NativeFinalizer(
+    bindings.freeBufferPointer.cast(),
+  );
+}
+
+// ─── Worker tasks (run on pooled worker isolates) ───────────────────────────
+
+class _CompressFileTask extends WorkerTask<_TransferableCompressResult> {
+  const _CompressFileTask(this.path, this.settings);
+
+  final String path;
+  final _CompressSettings settings;
+
+  @override
+  _TransferableCompressResult run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeCompressResult>();
+      bindings.compressFile(
+        path.toNativeUtf8(allocator: arena),
+        settings.toNative(arena),
+        out,
+      );
+      return _convertCompressResult(out, bindings);
+    });
+  }
+}
+
+class _CompressFileToFileTask extends WorkerTask<_TransferableCompressResult> {
+  const _CompressFileToFileTask(this.inputPath, this.outputPath, this.settings);
+
+  final String inputPath;
+  final String outputPath;
+  final _CompressSettings settings;
+
+  @override
+  _TransferableCompressResult run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeCompressResult>();
+      bindings.compressFileToFile(
+        inputPath.toNativeUtf8(allocator: arena),
+        outputPath.toNativeUtf8(allocator: arena),
+        settings.toNative(arena),
+        out,
+      );
+      return _convertCompressResult(out, bindings);
+    });
+  }
+}
+
+/// Compresses bytes the caller already copied into native memory.
+///
+/// The buffer at [address] is owned (allocated and freed) by the calling
+/// isolate, which keeps it alive until this task has finished or its worker
+/// has exited.
+class _CompressBufferTask extends WorkerTask<_TransferableCompressResult> {
+  const _CompressBufferTask(this.address, this.length, this.settings);
+
+  final int address;
+  final int length;
+  final _CompressSettings settings;
+
+  @override
+  _TransferableCompressResult run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeCompressResult>();
+      bindings.compressBuffer(
+        Pointer<Uint8>.fromAddress(address),
+        length,
+        settings.toNative(arena),
+        out,
+      );
+      return _convertCompressResult(out, bindings);
+    });
+  }
+}
+
+class _ProbeFileTask extends WorkerTask<ImageProbe> {
+  const _ProbeFileTask(this.path);
+
+  final String path;
+
+  @override
+  ImageProbe run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeProbeResult>();
+      bindings.probeFile(path.toNativeUtf8(allocator: arena), out);
+      return _convertProbeResult(out, bindings);
+    });
+  }
+}
+
+/// See [_CompressBufferTask] for buffer ownership.
+class _ProbeBufferTask extends WorkerTask<ImageProbe> {
+  const _ProbeBufferTask(this.address, this.length);
+
+  final int address;
+  final int length;
+
+  @override
+  ImageProbe run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeProbeResult>();
+      bindings.probeBuffer(Pointer<Uint8>.fromAddress(address), length, out);
+      return _convertProbeResult(out, bindings);
+    });
+  }
+}
+
+class _BenchmarkFileTask extends WorkerTask<BenchmarkResult> {
+  const _BenchmarkFileTask(this.path, this.settings);
+
+  final String path;
+  final _CompressSettings settings;
+
+  @override
+  BenchmarkResult run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeBenchmarkResult>();
+      bindings.benchmarkFile(
+        path.toNativeUtf8(allocator: arena),
+        settings.toNative(arena),
+        out,
+      );
+      return _convertBenchmarkResult(out, bindings);
+    });
+  }
+}
+
+/// See [_CompressBufferTask] for buffer ownership.
+class _BenchmarkBufferTask extends WorkerTask<BenchmarkResult> {
+  const _BenchmarkBufferTask(this.address, this.length, this.settings);
+
+  final int address;
+  final int length;
+  final _CompressSettings settings;
+
+  @override
+  BenchmarkResult run(WorkerTaskContext context) {
+    final bindings = _nativeBindings();
+    return using((arena) {
+      final out = arena<NativeBenchmarkResult>();
+      bindings.benchmarkBuffer(
+        Pointer<Uint8>.fromAddress(address),
+        length,
+        settings.toNative(arena),
+        out,
+      );
+      return _convertBenchmarkResult(out, bindings);
+    });
+  }
+}
+
+// ─── Batch protocol ─────────────────────────────────────────────────────────
+
+/// Batch item description sent to the worker. Byte inputs are not included:
+/// the caller copies them into native memory on request.
+class _BatchItem {
+  const _BatchItem({this.path, this.dataLength, this.outputPath});
+
+  final String? path;
+
+  /// Length of the in-memory input, or null for path inputs.
+  final int? dataLength;
+  final String? outputPath;
+}
+
+/// Worker → caller: copy the byte inputs of chunk [index] to native memory.
+class _BatchChunkRequest {
+  const _BatchChunkRequest(this.index);
+
+  final int index;
+}
+
+/// Caller → worker: native addresses for the items of chunk [index]
+/// (0 for path inputs or empty buffers), or an [error] if copying failed.
+class _BatchChunkData {
+  const _BatchChunkData(this.index, this.addresses, [this.error]);
+
+  final int index;
+  final List<int>? addresses;
+  final String? error;
+}
+
+/// Worker → caller: chunk [index] finished, its input buffers can be freed.
+class _BatchChunkDone {
+  const _BatchChunkDone(this.index);
+
+  final int index;
+}
+
+class _BatchTask extends WorkerTask<_TransferableBatchCompressResult> {
+  const _BatchTask({
+    required this.items,
+    required this.settings,
+    required this.threadCount,
+    required this.chunkSize,
+    required this.memoryBudget,
+    required this.streamsData,
+    required this.controlAddress,
+  });
+
+  final List<_BatchItem> items;
+  final _CompressSettings settings;
+  final int threadCount;
+
+  /// Items per native call. Equal to the item count (one native call) unless
+  /// large byte inputs must be copied to native memory chunk by chunk.
+  final int chunkSize;
+
+  /// Native memory budget in bytes (0 = default).
+  final int memoryBudget;
+
+  /// Whether some items are in-memory inputs that must be requested from
+  /// the caller (all at once when [chunkSize] covers every item).
+  final bool streamsData;
+
+  /// Address of the caller-owned [NativeBatchControl] (progress counter and
+  /// cancellation flag). The caller keeps it alive until this task is done.
+  final int controlAddress;
+
+  @override
+  Future<_TransferableBatchCompressResult> run(
+    WorkerTaskContext context,
+  ) async {
+    final bindings = _nativeBindings();
+    final finalizer = _outputFinalizerFor(bindings);
+    final control = Pointer<NativeBatchControl>.fromAddress(controlAddress);
+    bool cancelled() => control.ref.cancelled != 0;
+
+    final stopwatch = Stopwatch()..start();
+    final results = <_TransferableCompressResult>[];
+    final guards = <_OutputGuard?>[];
+    final chunkWaiters = <int, Completer<_BatchChunkData>>{};
+
+    context.onMessage = (message) {
+      if (message is _BatchChunkData) {
+        chunkWaiters.remove(message.index)?.complete(message);
+      }
+    };
+
+    final paramsPtr = settings.toNative(calloc);
+    try {
+      final total = items.length;
+      final chunkCount = (total + chunkSize - 1) ~/ chunkSize;
+
+      Future<_BatchChunkData>? requestChunk(int index) {
+        if (!streamsData) {
+          return null;
+        }
+        final waiter = Completer<_BatchChunkData>();
+        chunkWaiters[index] = waiter;
+        context.send(_BatchChunkRequest(index));
+        return waiter.future;
+      }
+
+      var pending = requestChunk(0);
+      for (var index = 0; index < chunkCount; index++) {
+        if (cancelled()) {
+          break;
+        }
+        final chunkData = pending == null ? null : await pending;
+        if (cancelled()) {
+          break;
+        }
+        if (chunkData != null && chunkData.addresses == null) {
+          throw StateError(
+            chunkData.error ?? 'Failed to copy batch input to native memory',
+          );
+        }
+
+        final start = index * chunkSize;
+        final end = math.min(start + chunkSize, total);
+        // Prefetch: the caller copies the next chunk while this one runs.
+        pending = index + 1 < chunkCount ? requestChunk(index + 1) : null;
+
+        final chunkResults = _compressBatchChunk(
+          bindings,
+          items.sublist(start, end),
+          chunkData?.addresses,
+          paramsPtr,
+          threadCount: threadCount,
+          memoryBudget: memoryBudget,
+          control: control,
+        );
+        for (final result in chunkResults) {
+          results.add(result);
+          final output = result.output;
+          guards.add(output == null ? null : _OutputGuard(output, finalizer));
+        }
+
+        if (streamsData) {
+          context.send(_BatchChunkDone(index));
+        }
+        if (chunkResults.length < end - start) {
+          // Cancelled during the native call: the rest was skipped.
+          break;
+        }
+      }
+    } catch (_) {
+      for (final guard in guards) {
+        guard?.free();
+      }
+      rethrow;
+    } finally {
+      calloc.free(paramsPtr);
+    }
+
+    // Hand every output over to the caller.
+    for (final guard in guards) {
+      guard?.release();
+    }
+    stopwatch.stop();
+    return _TransferableBatchCompressResult(
+      results: results,
+      elapsedMs: stopwatch.elapsedMilliseconds,
+    );
+  }
+}
+
+/// Main-isolate owner of the native input buffers of a streaming batch.
+class _BatchInputBuffers {
+  _BatchInputBuffers(this.inputs, this.chunkSize);
+
+  final List<CompressInput> inputs;
+  final int chunkSize;
+  final Map<int, List<Pointer<Uint8>>> _live = <int, List<Pointer<Uint8>>>{};
+
+  /// Copies the byte inputs of chunk [index] into native memory and returns
+  /// their addresses (0 for path inputs and empty buffers).
+  List<int> allocate(int index) {
+    free(index);
+    final start = index * chunkSize;
+    final end = math.min(start + chunkSize, inputs.length);
+    final pointers = <Pointer<Uint8>>[];
+    final addresses = List<int>.filled(end - start, 0);
+    try {
+      for (var i = start; i < end; i++) {
+        final data = inputs[i].data;
+        if (data == null || data.isEmpty) {
+          continue;
+        }
+        final pointer = _copyToNative(data);
+        pointers.add(pointer);
+        addresses[i - start] = pointer.address;
+      }
+    } catch (_) {
+      pointers.forEach(malloc.free);
+      rethrow;
+    }
+    _live[index] = pointers;
+    return addresses;
+  }
+
+  void free(int index) {
+    _live.remove(index)?.forEach(malloc.free);
+  }
+
+  void freeAll() {
+    for (final pointers in _live.values) {
+      pointers.forEach(malloc.free);
+    }
+    _live.clear();
+  }
+}
+
+// ─── Native helpers (worker side) ───────────────────────────────────────────
+
+Pointer<Uint8> _copyToNative(Uint8List data) {
+  final pointer = malloc<Uint8>(data.length);
+  pointer.asTypedList(data.length).setAll(0, data);
+  return pointer;
+}
+
+/// Copies [data] into native memory owned by the calling isolate, runs
+/// [createTask] on a worker with its address, and frees the copy once the
+/// worker is done with it — whether the task succeeded, threw, or the worker
+/// died. This avoids an intermediate `TransferableTypedData` copy.
+Future<T> _runWithNativeCopy<T>(
+  Uint8List data,
+  WorkerTask<T> Function(int address, int length) createTask,
+) async {
+  final pointer = _copyToNative(data);
+  try {
+    return await _pool.run(createTask(pointer.address, data.length));
+  } finally {
+    malloc.free(pointer);
+  }
+}
+
+String _nativeErrorMessage(Pointer<Utf8> message, String fallback) {
+  return message != nullptr ? message.toDartString() : fallback;
+}
+
+/// Converts a native compress result and releases its native payload. The
+/// result struct itself belongs to the caller's allocator.
+_TransferableCompressResult _convertCompressResult(
+  Pointer<NativeCompressResult> outPtr,
+  NativeBindings bindings,
+) {
+  try {
+    final ref = outPtr.ref;
+    if (ref.errorCode != 0) {
+      throw CompressException(
+        ref.errorCode,
+        _nativeErrorMessage(
+          ref.errorMessage,
+          'Unknown error (code ${ref.errorCode})',
+        ),
+      );
+    }
+    return _successResult(ref, bindings);
+  } finally {
+    bindings.freeCompressResult(outPtr);
+  }
+}
+
+/// Converts a successful native result, taking over its output buffer (the
+/// `buffer` field is cleared so that freeing the result leaves it alone).
+_TransferableCompressResult _successResult(
+  NativeCompressResult ref,
+  NativeBindings bindings,
+) {
+  _NativeOutput? output;
+  if (ref.buffer != nullptr && ref.data != nullptr && ref.dataLen > 0) {
+    output = _NativeOutput(
+      ref.buffer.address,
+      ref.data.address,
+      ref.dataLen,
+      bindings.freeBufferPointer.address,
+    );
+    ref.buffer = nullptr;
+  }
+  return _TransferableCompressResult(
+    output: output,
+    originalSize: ref.originalSize,
+    compressedSize: ref.dataLen,
+    width: ref.width,
+    height: ref.height,
+    qualityUsed: ref.qualityUsed,
+    iterations: ref.iterations,
+    resizedToFit: ref.resizedToFit != 0,
+  );
+}
+
+ImageProbe _convertProbeResult(
+  Pointer<NativeProbeResult> outPtr,
+  NativeBindings bindings,
+) {
+  try {
+    final ref = outPtr.ref;
+    if (ref.errorCode != 0) {
+      throw CompressException(
+        ref.errorCode,
+        _nativeErrorMessage(
+          ref.errorMessage,
+          'Probe failed (code ${ref.errorCode})',
+        ),
+      );
+    }
+    return ImageProbe(
+      width: ref.width,
+      height: ref.height,
+      format: ImageFormat.fromValue(ref.format),
+      fileSize: ref.fileSize,
+      hasExif: ref.hasExif != 0,
+      orientation: ref.orientation == 0 ? 1 : ref.orientation,
+    );
+  } finally {
+    bindings.freeProbeResult(outPtr);
+  }
+}
+
+BenchmarkResult _convertBenchmarkResult(
+  Pointer<NativeBenchmarkResult> outPtr,
+  NativeBindings bindings,
+) {
+  try {
+    final ref = outPtr.ref;
+    if (ref.errorCode != 0) {
+      throw CompressException(
+        ref.errorCode,
+        _nativeErrorMessage(
+          ref.errorMessage,
+          'Benchmark failed (code ${ref.errorCode})',
+        ),
+      );
+    }
+    return BenchmarkResult(
+      originalSize: ref.originalSize,
+      width: ref.width,
+      height: ref.height,
+      format: ImageFormat.fromValue(ref.format),
+      entries: [
+        for (var i = 0; i < ref.entryCount; i++)
+          BenchmarkEntry(
+            quality: ref.entries[i].quality,
+            sizeBytes: ref.entries[i].sizeBytes,
+            ratio: ref.entries[i].ratio,
+            encodeMs: ref.entries[i].encodeMs,
+          ),
+      ],
+      recommendedQuality: ref.recommendedQuality,
+    );
+  } finally {
+    bindings.freeBenchmarkResult(outPtr);
+  }
+}
+
+/// Runs one native `compress_batch` call over [items].
+///
+/// [addresses] holds the native buffers of in-memory items (owned by the
+/// caller isolate); it may be null when every item is a path input. Returns
+/// fewer results than [items] when [control] was cancelled during the call
+/// (the results are then the leading items that were started).
+List<_TransferableCompressResult> _compressBatchChunk(
+  NativeBindings bindings,
+  List<_BatchItem> items,
+  List<int>? addresses,
+  Pointer<NativeCompressParams> paramsPtr, {
+  required int threadCount,
+  required int memoryBudget,
+  required Pointer<NativeBatchControl> control,
+}) {
+  return using((arena) {
+    final nativeInputs = arena<NativeBatchInput>(items.length);
+    for (var i = 0; i < items.length; i++) {
+      final item = items[i];
+      final ref = nativeInputs[i];
+      final path = item.path;
+      final dataLength = item.dataLength;
+      final outputPath = item.outputPath;
+      ref.filePath = path == null
+          ? nullptr
+          : path.toNativeUtf8(allocator: arena);
+      if (path == null && dataLength != null && addresses != null) {
+        ref.data = Pointer<Uint8>.fromAddress(addresses[i]);
+        ref.dataLen = addresses[i] == 0 ? 0 : dataLength;
+      } else {
+        ref.data = nullptr;
+        ref.dataLen = 0;
+      }
+      ref.outputPath = outputPath == null
+          ? nullptr
+          : outputPath.toNativeUtf8(allocator: arena);
+    }
+
+    final batchOutPtr = arena<NativeBatchResult>();
+    final results = <_TransferableCompressResult>[];
+    try {
+      bindings.compressBatch(
+        nativeInputs,
+        items.length,
+        paramsPtr,
+        threadCount,
+        memoryBudget,
+        control,
+        batchOutPtr,
+      );
+
+      final batchRef = batchOutPtr.ref;
+      for (var i = 0; i < batchRef.count; i++) {
+        final native = batchRef.results[i];
+        if (native.errorCode != 0) {
+          results.add(
+            _TransferableCompressResult(
+              originalSize: native.originalSize,
+              compressedSize: 0,
+              width: 0,
+              height: 0,
+              qualityUsed: 0,
+              iterations: 0,
+              resizedToFit: false,
+              errorCode: native.errorCode,
+              errorMessage: _nativeErrorMessage(
+                native.errorMessage,
+                'Error (code ${native.errorCode})',
+              ),
+            ),
+          );
+        } else {
+          results.add(_successResult(native, bindings));
+        }
+      }
+      return results;
+    } catch (_) {
+      // Outputs already taken over would no longer be freed with the batch.
+      for (final result in results) {
+        result.disposeUndelivered();
+      }
+      rethrow;
+    } finally {
+      // Always release the native results (outputs taken over are skipped).
+      bindings.freeBatchResult(batchOutPtr);
+    }
+  });
+}
+
+/// Maps a failure of a batch that reports progress or supports cancellation
+/// to the exception type that path has always surfaced.
+Object _eventBatchError(Object error, StackTrace stackTrace) {
+  if (error is CompressException) {
+    return error;
+  }
+  final trace = stackTrace.toString();
+  return StateError(trace.isEmpty ? '$error' : '$error\n$trace');
 }
 
 /// High-performance image compression powered by Rust.
@@ -318,7 +1026,9 @@ class _TransferableBatchCompressResult {
 /// Uses mozjpeg (trellis quantization) for JPEG and oxipng for PNG —
 /// delivering consistent, high-quality results across all platforms.
 ///
-/// All operations run on a background isolate to keep the UI responsive.
+/// All operations run on a small pool of long-lived background isolates to
+/// keep the UI responsive. Workers load the native library once and exit
+/// after a few seconds without work.
 ///
 /// ```dart
 /// // Simple usage
@@ -337,24 +1047,6 @@ class Ironpress {
   // Prevent instantiation
   Ironpress._();
 
-  static NativeBindings? _bindings;
-
-  /// Lazily initialize native bindings with ABI version check.
-  static NativeBindings get _b {
-    if (_bindings == null) {
-      _bindings = _getBindings();
-      final version = _bindings!.abiVersion();
-      if (version != _expectedAbiVersion) {
-        _bindings = null;
-        throw StateError(
-          'Ironpress ABI version mismatch: native=$version, '
-          'expected=$_expectedAbiVersion. Rebuild the native library.',
-        );
-      }
-    }
-    return _bindings!;
-  }
-
   // ─── Public API ──────────────────────────────────────────────────────
 
   /// Compress an image file and return the result as bytes.
@@ -369,13 +1061,16 @@ class Ironpress {
   /// [quality] — JPEG quality 0-100. Default: 80. Ignored for PNG output.
   ///
   /// [maxWidth] / [maxHeight] — Resize constraints. Image is scaled down
-  /// to fit within these bounds while preserving aspect ratio.
+  /// to fit within these bounds while preserving aspect ratio. The EXIF
+  /// orientation is applied first, so the bounds refer to the image as
+  /// displayed.
   ///
   /// [maxFileSize] — Target maximum output size in bytes. When set,
-  /// the engine performs a binary search to find the highest quality
-  /// that fits. This is the killer feature — one FFI call, no round-trips.
+  /// the engine searches for the highest quality that fits (size-model
+  /// interpolation, typically 3-5 encodes). This is the killer feature —
+  /// one FFI call, no round-trips.
   ///
-  /// [minQuality] — Quality floor for the binary search (default: 30).
+  /// [minQuality] — Quality floor for the quality search (default: 30).
   ///
   /// [allowResize] — If quality alone can't hit [maxFileSize], allow
   /// automatic downscaling. Default: `true`.
@@ -383,7 +1078,9 @@ class Ironpress {
   /// [format] — Output format. Default: [CompressFormat.auto] (same as input).
   ///
   /// [keepMetadata] — Preserve JPEG EXIF metadata when compressing JPEG to
-  /// JPEG. Other paths silently drop metadata.
+  /// JPEG. The pixels are always rotated into display orientation, so the
+  /// kept EXIF Orientation tag is reset to 1. Other paths silently drop
+  /// metadata.
   ///
   /// [jpeg] — Advanced JPEG options (progressive, trellis, chroma).
   ///
@@ -400,7 +1097,7 @@ class Ironpress {
   /// );
   /// print(result); // CompressResult(4.2 MB → 380 KB [91%], 1920x1440, q80)
   ///
-  /// // Target file size — binary search in Rust, single FFI call
+  /// // Target file size — quality search in Rust, single FFI call
   /// final result = await Ironpress.compressFile(
   ///   '/path/to/photo.jpg',
   ///   maxFileSize: 200 * 1024, // 200 KB
@@ -432,25 +1129,20 @@ class Ironpress {
       minQuality: minQuality,
       png: png,
     );
-    final effectiveQuality = quality ?? preset?.quality ?? 80;
-    final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
-    final effectiveMaxHeight = maxHeight ?? preset?.maxHeight;
-    final effectiveMinQuality = minQuality ?? preset?.minQuality ?? 30;
-    final result = await Isolate.run(() {
-      return _compressFileTransferSync(
-        path,
-        quality: effectiveQuality,
-        maxWidth: effectiveMaxWidth,
-        maxHeight: effectiveMaxHeight,
-        maxFileSize: maxFileSize,
-        minQuality: effectiveMinQuality,
-        allowResize: allowResize,
-        format: format,
-        keepMetadata: keepMetadata,
-        jpeg: jpeg,
-        png: png,
-      );
-    });
+    final settings = _CompressSettings.resolve(
+      preset: preset,
+      quality: quality,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      maxFileSize: maxFileSize,
+      minQuality: minQuality,
+      allowResize: allowResize,
+      format: format,
+      keepMetadata: keepMetadata,
+      jpeg: jpeg,
+      png: png,
+    );
+    final result = await _pool.run(_CompressFileTask(path, settings));
     return result.materialize();
   }
 
@@ -501,26 +1193,22 @@ class Ironpress {
       minQuality: minQuality,
       png: png,
     );
-    final effectiveQuality = quality ?? preset?.quality ?? 80;
-    final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
-    final effectiveMaxHeight = maxHeight ?? preset?.maxHeight;
-    final effectiveMinQuality = minQuality ?? preset?.minQuality ?? 30;
-    final result = await Isolate.run(() {
-      return _compressFileToFileTransferSync(
-        inputPath,
-        outputPath,
-        quality: effectiveQuality,
-        maxWidth: effectiveMaxWidth,
-        maxHeight: effectiveMaxHeight,
-        maxFileSize: maxFileSize,
-        minQuality: effectiveMinQuality,
-        allowResize: allowResize,
-        format: format,
-        keepMetadata: keepMetadata,
-        jpeg: jpeg,
-        png: png,
-      );
-    });
+    final settings = _CompressSettings.resolve(
+      preset: preset,
+      quality: quality,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      maxFileSize: maxFileSize,
+      minQuality: minQuality,
+      allowResize: allowResize,
+      format: format,
+      keepMetadata: keepMetadata,
+      jpeg: jpeg,
+      png: png,
+    );
+    final result = await _pool.run(
+      _CompressFileToFileTask(inputPath, outputPath, settings),
+    );
     return result.materialize();
   }
 
@@ -573,49 +1261,84 @@ class Ironpress {
       minQuality: minQuality,
       png: png,
     );
-    final effectiveQuality = quality ?? preset?.quality ?? 80;
-    final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
-    final effectiveMaxHeight = maxHeight ?? preset?.maxHeight;
-    final effectiveMinQuality = minQuality ?? preset?.minQuality ?? 30;
-    final transferData = TransferableTypedData.fromList([data]);
-    final result = await Isolate.run(() {
-      return _compressBytesTransferSync(
-        transferData.materialize().asUint8List(),
-        quality: effectiveQuality,
-        maxWidth: effectiveMaxWidth,
-        maxHeight: effectiveMaxHeight,
-        maxFileSize: maxFileSize,
-        minQuality: effectiveMinQuality,
-        allowResize: allowResize,
-        format: format,
-        keepMetadata: keepMetadata,
-        jpeg: jpeg,
-        png: png,
-      );
-    });
+    final settings = _CompressSettings.resolve(
+      preset: preset,
+      quality: quality,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      maxFileSize: maxFileSize,
+      minQuality: minQuality,
+      allowResize: allowResize,
+      format: format,
+      keepMetadata: keepMetadata,
+      jpeg: jpeg,
+      png: png,
+    );
+    final result = await _runWithNativeCopy(
+      data,
+      (address, length) => _CompressBufferTask(address, length, settings),
+    );
     return result.materialize();
   }
 
   /// Batch compress multiple images using Rust's rayon thread pool.
   ///
-  /// **Performance:** Single FFI call → rayon splits across CPU cores with
+  /// **Performance:** rayon splits the work across CPU cores with
   /// zero-copy shared params. For 200 inspection photos, this is 3-5x faster
   /// than sequential Dart isolates.
   ///
+  /// **Scheduling:** the batch is normally handed to the native engine in a
+  /// single call, so no thread idles waiting for a slow image before the
+  /// next ones can start — also with [onProgress] and [cancellationToken],
+  /// which work through a small shared native block (a completed-items
+  /// counter polled by this isolate and a cancellation flag) instead of
+  /// splitting the batch.
+  ///
+  /// In-memory (`data`) inputs must be copied to native memory. When their
+  /// total size is at most a quarter of the memory budget (128 MB by
+  /// default) they are copied at once when the batch starts; larger byte
+  /// batches are copied and compressed [chunkSize] items at a time (default
+  /// 8, plus one chunk of prefetch), which bounds the extra native memory to
+  /// about two chunks of input bytes. Path inputs never need a copy and
+  /// ignore [chunkSize]. In-memory inputs are read lazily: do not modify
+  /// their buffers until the returned future completes.
+  ///
+  /// **Memory budget:** images are started in order only while the sum of
+  /// their estimated peak memory (from the image header: decode size, which
+  /// accounts for EXIF rotation and reduced-size JPEG decoding, plus the
+  /// encoder working set) stays within [memoryBudgetBytes] — `null` or 0
+  /// selects the default of 512 MB. Large images therefore run with less
+  /// concurrency instead of all being decoded at once; a single image larger
+  /// than the budget still runs, alone. The accounting is process-wide:
+  /// each batch admits an image only while the estimated memory of *all*
+  /// running batch images (from every concurrent call) plus the new image
+  /// fits its own budget, so with equal budgets concurrent batches share one
+  /// limit, and a batch with a smaller budget waits for the others to drain.
+  ///
   /// **Safety:** Designed to never hang, OOM, or crash your app:
-  /// - [chunkSize] limits how many images are decoded simultaneously
-  ///   (default 8 ≈ ~288 MB peak for 4K photos). Between chunks, all
-  ///   decoded pixel buffers are freed.
   /// - [threadCount] defaults to `cores - 2`, leaving room for Flutter
-  ///   UI thread and Dart isolate. Your app stays responsive.
+  ///   UI thread and Dart isolate. Your app stays responsive. It also bounds
+  ///   how many images are decoded simultaneously.
   /// - Each item is panic-safe: a corrupt JPEG or OOM on one image
   ///   produces an error result, not a process crash.
   ///
   /// **Progress:** Pass [onProgress] to get live updates. Called on the
-  /// main thread with `(completed, total)` — safe to call `setState` directly.
+  /// calling isolate with `(completed, total)` — safe to call `setState`
+  /// directly. `completed` counts finished images (successful or failed),
+  /// increases monotonically (polled about every 16 ms, so several images
+  /// may complete between two calls) and is reported at most once per
+  /// value; the last call reports the final number of results (`total`
+  /// unless cancelled).
   ///
-  /// **Cancellation:** Pass a [CancellationToken] to cancel between chunks.
-  /// Returns partial results for already-completed chunks.
+  /// **Cancellation:** Pass a [CancellationToken] to cancel. Images that
+  /// have not started yet are skipped; images already being compressed
+  /// finish. The returned result holds the images that were processed — the
+  /// leading part of [inputs], in order. Cancelling before the batch starts
+  /// returns an empty result.
+  ///
+  /// **Output bytes** (`CompressResult.data`) are native memory owned by the
+  /// returned list and released when it is garbage collected (no copy is
+  /// made on the way back from the native engine).
   ///
   /// ```dart
   /// final token = CancellationToken();
@@ -646,6 +1369,7 @@ class Ironpress {
     PngOptions png = const PngOptions(),
     int threadCount = 0,
     int chunkSize = 8,
+    int? memoryBudgetBytes,
     void Function(int completed, int total)? onProgress,
     CancellationToken? cancellationToken,
   }) async {
@@ -657,11 +1381,11 @@ class Ironpress {
       minQuality: minQuality,
       png: png,
     );
-    _validateBatchArgs(threadCount: threadCount, chunkSize: chunkSize);
-    final effectiveQuality = quality ?? preset?.quality ?? 80;
-    final effectiveMaxWidth = maxWidth ?? preset?.maxWidth;
-    final effectiveMaxHeight = maxHeight ?? preset?.maxHeight;
-    final effectiveMinQuality = minQuality ?? preset?.minQuality ?? 30;
+    _validateBatchArgs(
+      threadCount: threadCount,
+      chunkSize: chunkSize,
+      memoryBudgetBytes: memoryBudgetBytes,
+    );
     final total = inputs.length;
     if (total == 0) {
       return const BatchCompressResult(results: [], elapsedMs: 0);
@@ -670,66 +1394,114 @@ class Ironpress {
       return const BatchCompressResult(results: [], elapsedMs: 0);
     }
 
-    final transferableInputs = inputs
-        .map(
-          (i) => _BatchInputSpec(
-            path: i.path,
-            data: i.data,
-            outputPath: i.outputPath,
-          ),
-        )
-        .map(
-          (input) => _TransferableBatchInputSpec(
-            path: input.path,
-            data: input.data == null
-                ? null
-                : TransferableTypedData.fromList([input.data!]),
-            outputPath: input.outputPath,
-          ),
-        )
-        .toList(growable: false);
+    final settings = _CompressSettings.resolve(
+      preset: preset,
+      quality: quality,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      maxFileSize: maxFileSize,
+      minQuality: minQuality,
+      allowResize: allowResize,
+      format: format,
+      keepMetadata: keepMetadata,
+      jpeg: jpeg,
+      png: png,
+    );
+    // Snapshot the inputs: the caller may mutate its list while we run.
+    final snapshot = List<CompressInput>.of(inputs, growable: false);
+    final items = [
+      for (final input in snapshot)
+        _BatchItem(
+          path: input.path,
+          dataLength: input.path == null ? input.data?.length : null,
+          outputPath: input.outputPath,
+        ),
+    ];
+    final streamsData = items.any((item) => item.dataLength != null);
+    final dataBytes = items.fold<int>(
+      0,
+      (sum, item) => sum + (item.dataLength ?? 0),
+    );
+    final budget = (memoryBudgetBytes ?? 0) == 0
+        ? _defaultBatchMemoryBudget
+        : memoryBudgetBytes!;
+    final nativeChunkSize =
+        !streamsData || dataBytes <= budget ~/ _bulkCopyBudgetDivisor
+        ? total
+        : chunkSize;
+    final hasEvents = onProgress != null || cancellationToken != null;
+    final buffers = _BatchInputBuffers(snapshot, nativeChunkSize);
+    // Shared with the native call: progress counter + cancellation flag.
+    final control = calloc<NativeBatchControl>();
+    var lastCompleted = 0;
 
-    if (onProgress != null || cancellationToken != null) {
-      return _compressBatchWithEvents(
-        transferableInputs,
-        total: total,
-        quality: effectiveQuality,
-        maxWidth: effectiveMaxWidth,
-        maxHeight: effectiveMaxHeight,
-        maxFileSize: maxFileSize,
-        minQuality: effectiveMinQuality,
-        allowResize: allowResize,
-        format: format,
-        keepMetadata: keepMetadata,
-        jpeg: jpeg,
-        png: png,
-        threadCount: threadCount,
-        chunkSize: chunkSize,
-        onProgress: onProgress,
-        cancellationToken: cancellationToken,
-      );
+    void reportProgress(int completed) {
+      if (onProgress != null && completed > lastCompleted) {
+        lastCompleted = completed;
+        onProgress(completed, total);
+      }
     }
 
-    final result = await Isolate.run(() {
-      return _compressBatchTransferAsync(
-        transferableInputs
-            .map((input) => input.materialize())
-            .toList(growable: false),
-        quality: effectiveQuality,
-        maxWidth: effectiveMaxWidth,
-        maxHeight: effectiveMaxHeight,
-        maxFileSize: maxFileSize,
-        minQuality: effectiveMinQuality,
-        allowResize: allowResize,
-        format: format,
-        keepMetadata: keepMetadata,
-        jpeg: jpeg,
-        png: png,
+    final job = _pool.submit(
+      _BatchTask(
+        items: items,
+        settings: settings,
         threadCount: threadCount,
-        chunkSize: chunkSize,
-      );
+        chunkSize: nativeChunkSize,
+        memoryBudget: memoryBudgetBytes ?? 0,
+        streamsData: streamsData,
+        controlAddress: control.address,
+      ),
+      onEvent: (event, reply) {
+        if (event is _BatchChunkRequest) {
+          try {
+            reply(_BatchChunkData(event.index, buffers.allocate(event.index)));
+          } catch (error) {
+            reply(_BatchChunkData(event.index, null, '$error'));
+          }
+        } else if (event is _BatchChunkDone) {
+          buffers.free(event.index);
+          reportProgress(control.ref.completed);
+        }
+      },
+      crashError: hasEvents
+          ? (details) => CompressException(
+              _isolateCrashCode,
+              'Batch compression isolate crashed: $details',
+            )
+          : null,
+    );
+    final removeCancelListener = cancellationToken?.addListener(() {
+      control.ref.cancelled = 1;
     });
-    return result.materialize();
+    final poller = onProgress == null
+        ? null
+        : Timer.periodic(
+            _progressPollInterval,
+            (_) => reportProgress(control.ref.completed),
+          );
+
+    try {
+      final result = (await job.result).materialize();
+      poller?.cancel();
+      reportProgress(result.results.length);
+      return result;
+    } catch (error, stackTrace) {
+      if (!hasEvents) {
+        rethrow;
+      }
+      Error.throwWithStackTrace(
+        _eventBatchError(error, stackTrace),
+        stackTrace,
+      );
+    } finally {
+      poller?.cancel();
+      removeCancelListener?.call();
+      // The worker has finished (or died), so no native call can still be
+      // reading these buffers or the control block.
+      buffers.freeAll();
+      calloc.free(control);
+    }
   }
 
   // ─── Probe: Quick Metadata ───────────────────────────────────────────
@@ -751,155 +1523,11 @@ class Ironpress {
   ///   await Ironpress.compressFile(path, preset: CompressPreset.medium);
   /// }
   /// ```
-  // Internal: batch work with progress/cancellation needs one ordered event
-  // channel so progress and the terminal result cannot race each other.
-  static Future<BatchCompressResult> _compressBatchWithEvents(
-    List<_TransferableBatchInputSpec> batchInputs, {
-    required int total,
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-    required int threadCount,
-    required int chunkSize,
-    void Function(int completed, int total)? onProgress,
-    CancellationToken? cancellationToken,
-  }) async {
-    final eventPort = ReceivePort();
-    final errorPort = ReceivePort();
-    final resultCompleter = Completer<BatchCompressResult>();
-    StreamSubscription? eventSubscription;
-    StreamSubscription? errorSubscription;
-    SendPort? cancelSendPort;
-    var cancelSignalSent = false;
-    var lastCompleted = 0;
-
-    void completeError(Object error, [StackTrace? stackTrace]) {
-      if (!resultCompleter.isCompleted) {
-        resultCompleter.completeError(error, stackTrace);
-      }
-    }
-
-    void sendCancelSignal() {
-      if (cancelSignalSent || cancelSendPort == null) {
-        return;
-      }
-      cancelSignalSent = true;
-      cancelSendPort!.send(_cancelBatchMessage);
-    }
-
-    final removeCancelListener = cancellationToken?.addListener(
-      sendCancelSignal,
-    );
-
-    try {
-      eventSubscription = eventPort.listen((message) {
-        if (message is SendPort) {
-          cancelSendPort = message;
-          if (cancellationToken?.isCancelled ?? false) {
-            sendCancelSignal();
-          }
-          return;
-        }
-
-        if (message is int) {
-          lastCompleted = message;
-          onProgress?.call(message, total);
-          return;
-        }
-
-        if (message is _TransferableBatchCompressResult) {
-          final result = message.materialize();
-          final finalCompleted = result.results.length;
-          if (onProgress != null && lastCompleted != finalCompleted) {
-            lastCompleted = finalCompleted;
-            onProgress(finalCompleted, total);
-          }
-          if (!resultCompleter.isCompleted) {
-            resultCompleter.complete(result);
-          }
-          return;
-        }
-
-        if (message is _WorkerFailure) {
-          completeError(message.toException());
-        }
-      });
-
-      errorSubscription = errorPort.listen((message) {
-        final details = message is List && message.isNotEmpty
-            ? message.first.toString()
-            : 'unknown isolate error';
-        completeError(
-          CompressException(
-            _isolateCrashCode,
-            'Batch compression isolate crashed: $details',
-          ),
-        );
-      });
-
-      await Isolate.spawn<_BatchIsolateRequest>(
-        _batchWorkerMain,
-        _BatchIsolateRequest(
-          batchInputs: batchInputs,
-          eventPort: eventPort.sendPort,
-          quality: quality,
-          maxWidth: maxWidth,
-          maxHeight: maxHeight,
-          maxFileSize: maxFileSize,
-          minQuality: minQuality,
-          allowResize: allowResize,
-          format: format,
-          keepMetadata: keepMetadata,
-          jpeg: jpeg,
-          png: png,
-          threadCount: threadCount,
-          chunkSize: chunkSize,
-          reportProgress: onProgress != null,
-          enableCancellation: cancellationToken != null,
-        ),
-        onError: errorPort.sendPort,
-        errorsAreFatal: true,
-      );
-
-      return await resultCompleter.future;
-    } finally {
-      removeCancelListener?.call();
-      await eventSubscription?.cancel();
-      await errorSubscription?.cancel();
-      eventPort.close();
-      errorPort.close();
-    }
-  }
-
-  /// Read image metadata from a file without decoding pixel data.
-  ///
-  /// Much faster than compression â€” useful for validating images before
-  /// upload or checking resolution before deciding whether to resize.
-  ///
-  /// Throws [ArgumentError] if [path] is empty.
-  /// Throws [CompressException] if the file cannot be read or parsed.
-  ///
-  /// ```dart
-  /// final info = await Ironpress.probeFile('/path/to/photo.jpg');
-  /// print(info); // ImageProbe(4000x3000, JPEG, 4.2 MB, 12.0MP, EXIF)
-  ///
-  /// if (info.megapixels > 12) {
-  ///   // Only compress if large enough to benefit
-  ///   await Ironpress.compressFile(path, preset: CompressPreset.medium);
-  /// }
-  /// ```
   static Future<ImageProbe> probeFile(String path) async {
     if (path.isEmpty) {
       throw ArgumentError.value(path, 'path', 'must not be empty');
     }
-    return Isolate.run(() => _probeFileSync(path));
+    return _pool.run(_ProbeFileTask(path));
   }
 
   /// Read image metadata from bytes without decoding pixel data.
@@ -910,10 +1538,7 @@ class Ironpress {
     if (data.isEmpty) {
       throw ArgumentError.value(data, 'data', 'must not be empty');
     }
-    final transferData = TransferableTypedData.fromList([data]);
-    return Isolate.run(
-      () => _probeBytesSync(transferData.materialize().asUint8List()),
-    );
+    return _runWithNativeCopy(data, _ProbeBufferTask.new);
   }
 
   // ─── Benchmark: Quality Sweep ────────────────────────────────────────
@@ -947,8 +1572,11 @@ class Ironpress {
       throw ArgumentError.value(path, 'path', 'must not be empty');
     }
     _validateBenchmarkArgs(maxWidth: maxWidth, maxHeight: maxHeight);
-    return Isolate.run(
-      () => _benchmarkFileSync(path, maxWidth: maxWidth, maxHeight: maxHeight),
+    return _pool.run(
+      _BenchmarkFileTask(
+        path,
+        _CompressSettings.benchmark(maxWidth: maxWidth, maxHeight: maxHeight),
+      ),
     );
   }
 
@@ -964,577 +1592,18 @@ class Ironpress {
       throw ArgumentError.value(data, 'data', 'must not be empty');
     }
     _validateBenchmarkArgs(maxWidth: maxWidth, maxHeight: maxHeight);
-    final transferData = TransferableTypedData.fromList([data]);
-    return Isolate.run(
-      () => _benchmarkBytesSync(
-        transferData.materialize().asUint8List(),
-        maxWidth: maxWidth,
-        maxHeight: maxHeight,
-      ),
+    final settings = _CompressSettings.benchmark(
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+    );
+    return _runWithNativeCopy(
+      data,
+      (address, length) => _BenchmarkBufferTask(address, length, settings),
     );
   }
 
   /// Return the native library version string.
-  static String get nativeVersion {
-    final ptr = _b.version();
-    return ptr.toDartString();
-  }
-
-  // ─── Internal: Sync FFI calls (run on isolates) ──────────────────────
-
-  static Pointer<Uint8> _copyBytesToNative(Uint8List data) {
-    final nativeData = malloc<Uint8>(data.length);
-    nativeData.asTypedList(data.length).setAll(0, data);
-    return nativeData;
-  }
-
-  static _TransferableCompressResult _compressFileTransferSync(
-    String path, {
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-  }) {
-    final bindings = Ironpress._b;
-    final pathPtr = path.toNativeUtf8();
-    final paramsPtr = _buildParams(
-      quality: quality,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      maxFileSize: maxFileSize,
-      minQuality: minQuality,
-      allowResize: allowResize,
-      format: format,
-      keepMetadata: keepMetadata,
-      jpeg: jpeg,
-      png: png,
-    );
-    final outPtr = malloc<NativeCompressResult>();
-
-    try {
-      bindings.compressFile(pathPtr, paramsPtr, outPtr);
-      return _convertResultTransfer(outPtr, bindings);
-    } finally {
-      calloc.free(pathPtr);
-      calloc.free(paramsPtr);
-    }
-  }
-
-  static _TransferableCompressResult _compressFileToFileTransferSync(
-    String inputPath,
-    String outputPath, {
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-  }) {
-    final bindings = Ironpress._b;
-    final inputPtr = inputPath.toNativeUtf8();
-    final outputPtr = outputPath.toNativeUtf8();
-    final paramsPtr = _buildParams(
-      quality: quality,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      maxFileSize: maxFileSize,
-      minQuality: minQuality,
-      allowResize: allowResize,
-      format: format,
-      keepMetadata: keepMetadata,
-      jpeg: jpeg,
-      png: png,
-    );
-    final outPtr = malloc<NativeCompressResult>();
-
-    try {
-      bindings.compressFileToFile(inputPtr, outputPtr, paramsPtr, outPtr);
-      return _convertResultTransfer(outPtr, bindings);
-    } finally {
-      calloc.free(inputPtr);
-      calloc.free(outputPtr);
-      calloc.free(paramsPtr);
-    }
-  }
-
-  static _TransferableCompressResult _compressBytesTransferSync(
-    Uint8List data, {
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-  }) {
-    final bindings = Ironpress._b;
-    final nativeData = _copyBytesToNative(data);
-    final paramsPtr = _buildParams(
-      quality: quality,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      maxFileSize: maxFileSize,
-      minQuality: minQuality,
-      allowResize: allowResize,
-      format: format,
-      keepMetadata: keepMetadata,
-      jpeg: jpeg,
-      png: png,
-    );
-    final outPtr = malloc<NativeCompressResult>();
-
-    try {
-      bindings.compressBuffer(nativeData, data.length, paramsPtr, outPtr);
-      return _convertResultTransfer(outPtr, bindings);
-    } finally {
-      malloc.free(nativeData);
-      calloc.free(paramsPtr);
-    }
-  }
-
-  static ImageProbe _probeFileSync(String path) {
-    final bindings = Ironpress._b;
-    final pathPtr = path.toNativeUtf8();
-    final outPtr = malloc<NativeProbeResult>();
-
-    try {
-      bindings.probeFile(pathPtr, outPtr);
-      return _convertProbeResult(outPtr, bindings);
-    } finally {
-      calloc.free(pathPtr);
-    }
-  }
-
-  static ImageProbe _probeBytesSync(Uint8List data) {
-    final bindings = Ironpress._b;
-    final nativeData = _copyBytesToNative(data);
-    final outPtr = malloc<NativeProbeResult>();
-
-    try {
-      bindings.probeBuffer(nativeData, data.length, outPtr);
-      return _convertProbeResult(outPtr, bindings);
-    } finally {
-      malloc.free(nativeData);
-    }
-  }
-
-  // ─── Benchmark sync helpers ────────────────────────────────────────────
-
-  static BenchmarkResult _benchmarkFileSync(
-    String path, {
-    int? maxWidth,
-    int? maxHeight,
-  }) {
-    final bindings = Ironpress._b;
-    final pathPtr = path.toNativeUtf8();
-    final paramsPtr = _buildParams(
-      quality: 80,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      format: CompressFormat.auto,
-      keepMetadata: false,
-      jpeg: const JpegOptions(),
-      png: const PngOptions(),
-      minQuality: 30,
-      allowResize: true,
-    );
-    final outPtr = malloc<NativeBenchmarkResult>();
-
-    try {
-      bindings.benchmarkFile(pathPtr, paramsPtr, outPtr);
-      return _convertBenchmarkResult(outPtr, bindings);
-    } finally {
-      calloc.free(pathPtr);
-      calloc.free(paramsPtr);
-    }
-  }
-
-  static BenchmarkResult _benchmarkBytesSync(
-    Uint8List data, {
-    int? maxWidth,
-    int? maxHeight,
-  }) {
-    final bindings = Ironpress._b;
-    final nativeData = _copyBytesToNative(data);
-    final paramsPtr = _buildParams(
-      quality: 80,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      format: CompressFormat.auto,
-      keepMetadata: false,
-      jpeg: const JpegOptions(),
-      png: const PngOptions(),
-      minQuality: 30,
-      allowResize: true,
-    );
-    final outPtr = malloc<NativeBenchmarkResult>();
-
-    try {
-      bindings.benchmarkBuffer(nativeData, data.length, paramsPtr, outPtr);
-      return _convertBenchmarkResult(outPtr, bindings);
-    } finally {
-      malloc.free(nativeData);
-      calloc.free(paramsPtr);
-    }
-  }
-
-  // ─── Helpers ─────────────────────────────────────────────────────────
-
-  static Pointer<NativeCompressParams> _buildParams({
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-  }) {
-    final p = calloc<NativeCompressParams>();
-    p.ref.quality = quality.clamp(0, 100);
-    p.ref.maxWidth = maxWidth ?? 0;
-    p.ref.maxHeight = maxHeight ?? 0;
-    p.ref.maxFileSize = maxFileSize ?? 0;
-    p.ref.minQuality = minQuality.clamp(0, 100);
-    p.ref.allowResize = allowResize ? 1 : 0;
-    p.ref.format = format.value;
-    p.ref.keepMetadata = keepMetadata ? 1 : 0;
-    p.ref.jpegProgressive = jpeg.progressive ? 1 : 0;
-    p.ref.jpegChromaSubsampling = jpeg.chromaSubsampling.value;
-    p.ref.jpegTrellis = jpeg.trellis ? 1 : 0;
-    p.ref.pngOptimizationLevel = png.optimizationLevel.clamp(0, 6);
-    return p;
-  }
-
-  static _TransferableCompressResult _convertResultTransfer(
-    Pointer<NativeCompressResult> outPtr,
-    NativeBindings bindings,
-  ) {
-    try {
-      final ref = outPtr.ref;
-
-      if (ref.errorCode != 0) {
-        final msg = ref.errorMessage != nullptr
-            ? ref.errorMessage.toDartString()
-            : 'Unknown error (code ${ref.errorCode})';
-        throw CompressException(ref.errorCode, msg);
-      }
-
-      TransferableTypedData? transferData;
-      if (ref.data != nullptr && ref.dataLen > 0) {
-        transferData = TransferableTypedData.fromList([
-          ref.data.cast<Uint8>().asTypedList(ref.dataLen),
-        ]);
-      }
-
-      return _TransferableCompressResult(
-        data: transferData,
-        originalSize: ref.originalSize,
-        compressedSize: ref.dataLen,
-        width: ref.width,
-        height: ref.height,
-        qualityUsed: ref.qualityUsed,
-        iterations: ref.iterations,
-        resizedToFit: ref.resizedToFit != 0,
-      );
-    } finally {
-      bindings.freeCompressResult(outPtr);
-      malloc.free(outPtr);
-    }
-  }
-
-  static ImageProbe _convertProbeResult(
-    Pointer<NativeProbeResult> outPtr,
-    NativeBindings bindings,
-  ) {
-    try {
-      final ref = outPtr.ref;
-
-      if (ref.errorCode != 0) {
-        final msg = ref.errorMessage != nullptr
-            ? ref.errorMessage.toDartString()
-            : 'Probe failed (code ${ref.errorCode})';
-        throw CompressException(ref.errorCode, msg);
-      }
-
-      return ImageProbe(
-        width: ref.width,
-        height: ref.height,
-        format: ImageFormat.fromValue(ref.format),
-        fileSize: ref.fileSize,
-        hasExif: ref.hasExif != 0,
-      );
-    } finally {
-      bindings.freeProbeResult(outPtr);
-      malloc.free(outPtr);
-    }
-  }
-
-  /// Convert a native BenchmarkResult to Dart. Frees native memory.
-  static BenchmarkResult _convertBenchmarkResult(
-    Pointer<NativeBenchmarkResult> outPtr,
-    NativeBindings bindings,
-  ) {
-    try {
-      final ref = outPtr.ref;
-
-      if (ref.errorCode != 0) {
-        final msg = ref.errorMessage != nullptr
-            ? ref.errorMessage.toDartString()
-            : 'Benchmark failed (code ${ref.errorCode})';
-        throw CompressException(ref.errorCode, msg);
-      }
-
-      final entries = <BenchmarkEntry>[];
-      for (var i = 0; i < ref.entryCount; i++) {
-        final e = ref.entries[i];
-        entries.add(
-          BenchmarkEntry(
-            quality: e.quality,
-            sizeBytes: e.sizeBytes,
-            ratio: e.ratio,
-            encodeMs: e.encodeMs,
-          ),
-        );
-      }
-
-      return BenchmarkResult(
-        originalSize: ref.originalSize,
-        width: ref.width,
-        height: ref.height,
-        format: ImageFormat.fromValue(ref.format),
-        entries: entries,
-        recommendedQuality: ref.recommendedQuality,
-      );
-    } finally {
-      bindings.freeBenchmarkResult(outPtr);
-      malloc.free(outPtr);
-    }
-  }
-
-  static Future<_TransferableBatchCompressResult> _compressBatchTransferAsync(
-    List<_BatchInputSpec> inputs, {
-    required int quality,
-    int? maxWidth,
-    int? maxHeight,
-    int? maxFileSize,
-    required int minQuality,
-    required bool allowResize,
-    required CompressFormat format,
-    required bool keepMetadata,
-    required JpegOptions jpeg,
-    required PngOptions png,
-    required int threadCount,
-    required int chunkSize,
-    SendPort? progressSendPort,
-    SendPort? controlInitPort,
-  }) async {
-    final bindings = Ironpress._b;
-    final stopwatch = Stopwatch()..start();
-    final paramsPtr = _buildParams(
-      quality: quality,
-      maxWidth: maxWidth,
-      maxHeight: maxHeight,
-      maxFileSize: maxFileSize,
-      minQuality: minQuality,
-      allowResize: allowResize,
-      format: format,
-      keepMetadata: keepMetadata,
-      jpeg: jpeg,
-      png: png,
-    );
-
-    final allResults = <_TransferableCompressResult>[];
-    ReceivePort? controlPort;
-    StreamSubscription? controlSubscription;
-    var cancelled = false;
-    var completed = 0;
-
-    if (controlInitPort != null) {
-      controlPort = ReceivePort();
-      controlSubscription = controlPort.listen((message) {
-        if (message == _cancelBatchMessage) {
-          cancelled = true;
-        }
-      });
-      controlInitPort.send(controlPort.sendPort);
-    }
-
-    try {
-      for (var start = 0; start < inputs.length; start += chunkSize) {
-        if (cancelled) {
-          break;
-        }
-
-        final end = (start + chunkSize).clamp(0, inputs.length);
-        final chunkInputs = inputs.sublist(start, end);
-        allResults.addAll(
-          _compressBatchChunkTransferSync(
-            chunkInputs,
-            bindings,
-            paramsPtr,
-            threadCount: threadCount,
-            chunkSize: chunkSize,
-          ),
-        );
-
-        completed += chunkInputs.length;
-        progressSendPort?.send(completed);
-
-        if (end < inputs.length &&
-            (progressSendPort != null || controlInitPort != null)) {
-          await Future<void>.delayed(Duration.zero);
-        }
-      }
-    } finally {
-      await controlSubscription?.cancel();
-      controlPort?.close();
-      calloc.free(paramsPtr);
-    }
-
-    stopwatch.stop();
-    return _TransferableBatchCompressResult(
-      results: allResults,
-      elapsedMs: stopwatch.elapsedMilliseconds,
-    );
-  }
-
-  static List<_TransferableCompressResult> _compressBatchChunkTransferSync(
-    List<_BatchInputSpec> chunkInputs,
-    NativeBindings bindings,
-    Pointer<NativeCompressParams> paramsPtr, {
-    required int threadCount,
-    required int chunkSize,
-  }) {
-    final nativeInputs = calloc<NativeBatchInput>(chunkInputs.length);
-    final disposers = <void Function()>[];
-
-    try {
-      for (var i = 0; i < chunkInputs.length; i++) {
-        final spec = chunkInputs[i];
-        final ref = nativeInputs[i];
-
-        if (spec.path != null) {
-          final pathPtr = spec.path!.toNativeUtf8();
-          disposers.add(() => calloc.free(pathPtr));
-          ref.filePath = pathPtr;
-          ref.data = nullptr;
-          ref.dataLen = 0;
-        } else if (spec.data != null) {
-          final dataPtr = _copyBytesToNative(spec.data!);
-          disposers.add(() => malloc.free(dataPtr));
-          ref.filePath = nullptr;
-          ref.data = dataPtr;
-          ref.dataLen = spec.data!.length;
-        } else {
-          ref.filePath = nullptr;
-          ref.data = nullptr;
-          ref.dataLen = 0;
-        }
-
-        if (spec.outputPath != null) {
-          final outputPathPtr = spec.outputPath!.toNativeUtf8();
-          disposers.add(() => calloc.free(outputPathPtr));
-          ref.outputPath = outputPathPtr;
-        } else {
-          ref.outputPath = nullptr;
-        }
-      }
-
-      final batchOutPtr = malloc<NativeBatchResult>();
-
-      try {
-        bindings.compressBatch(
-          nativeInputs,
-          chunkInputs.length,
-          paramsPtr,
-          threadCount,
-          chunkSize,
-          batchOutPtr,
-        );
-
-        final results = <_TransferableCompressResult>[];
-        final batchRef = batchOutPtr.ref;
-
-        for (var i = 0; i < batchRef.count; i++) {
-          final native = batchRef.results[i];
-          if (native.errorCode != 0) {
-            final msg = native.errorMessage != nullptr
-                ? native.errorMessage.toDartString()
-                : 'Error (code ${native.errorCode})';
-            results.add(
-              _TransferableCompressResult(
-                originalSize: native.originalSize,
-                compressedSize: 0,
-                width: 0,
-                height: 0,
-                qualityUsed: 0,
-                iterations: 0,
-                resizedToFit: false,
-                errorCode: native.errorCode,
-                errorMessage: msg,
-              ),
-            );
-            continue;
-          }
-
-          TransferableTypedData? transferData;
-          if (native.data != nullptr && native.dataLen > 0) {
-            transferData = TransferableTypedData.fromList([
-              native.data.cast<Uint8>().asTypedList(native.dataLen),
-            ]);
-          }
-
-          results.add(
-            _TransferableCompressResult(
-              data: transferData,
-              originalSize: native.originalSize,
-              compressedSize: native.dataLen,
-              width: native.width,
-              height: native.height,
-              qualityUsed: native.qualityUsed,
-              iterations: native.iterations,
-              resizedToFit: native.resizedToFit != 0,
-            ),
-          );
-        }
-
-        bindings.freeBatchResult(batchOutPtr);
-        return results;
-      } finally {
-        malloc.free(batchOutPtr);
-      }
-    } finally {
-      for (final dispose in disposers) {
-        dispose();
-      }
-      calloc.free(nativeInputs);
-    }
-  }
-}
-
-/// Lightweight spec for crossing isolate boundary (no FFI pointers).
-class _BatchInputSpec {
-  const _BatchInputSpec({this.path, this.data, this.outputPath});
-
-  final String? path;
-  final Uint8List? data;
-  final String? outputPath;
+  static String get nativeVersion => _nativeBindings().version().toDartString();
 }
 
 /// Exception thrown when native compression fails.
@@ -1549,7 +1618,7 @@ class CompressException implements Exception {
   /// | -2   | Invalid UTF-8 path or empty buffer |
   /// | -3   | Failed to read input file |
   /// | -4   | Failed to write output file |
-  /// | -5   | Input exceeds 256 MB limit |
+  /// | -5   | Input exceeds the 256 MB size limit or the 100 MP pixel limit |
   /// | -10  | Compression engine error (unsupported format, corrupt data) |
   /// | -99  | Internal panic on a batch item |
   /// | -100 | Batch isolate crashed unexpectedly |
@@ -1570,7 +1639,8 @@ class CompressException implements Exception {
       case -4:
         return 'Verify the output directory exists and the app has write permission.';
       case -5:
-        return 'Input exceeds the 256 MB limit. Reduce input size or split into smaller files.';
+        return 'Input exceeds the 256 MB size limit or the 100 MP pixel limit. '
+            'Reduce the input size or resolution, or split it into smaller files.';
       case -10:
         return 'Ensure the input is a valid JPEG, PNG, or WebP file. '
             'GIF, BMP, and TIFF are accepted as input but must be intact.';

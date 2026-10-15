@@ -30,6 +30,8 @@ final class NativeCompressParams extends Struct {
   external int jpegTrellis;
   @Uint32()
   external int pngOptimizationLevel;
+  @Uint32()
+  external int pngLevelUnbounded;
 }
 
 /// Mirrors Rust's CompressResult #[repr(C)]
@@ -52,6 +54,11 @@ final class NativeCompressResult extends Struct {
   @Int32()
   external int errorCode;
   external Pointer<Utf8> errorMessage;
+
+  /// Opaque owner of [data]; take it over (and null this field) to keep the
+  /// bytes alive past `free_compress_result`, then release it with
+  /// `ironpress_free_buffer`.
+  external Pointer<Void> buffer;
 }
 
 /// Mirrors Rust's BatchInput #[repr(C)]
@@ -70,8 +77,17 @@ final class NativeBatchResult extends Struct {
   external int count;
   @Uint64()
   external int elapsedMs;
-  // Reserved for ABI compatibility with prebuilt native libraries.
-  external Pointer<Uint32> completed;
+}
+
+/// Mirrors Rust's BatchControl #[repr(C)] (two `AtomicU32`s).
+///
+/// Shared between the native batch call and the caller's isolates: aligned
+/// 32-bit loads/stores are single-copy atomic on every supported CPU.
+final class NativeBatchControl extends Struct {
+  @Uint32()
+  external int completed;
+  @Uint32()
+  external int cancelled;
 }
 
 // ─── Native function typedefs ────────────────────────────────────────────────
@@ -116,13 +132,15 @@ typedef CompressFileToFileDart = void Function(
   Pointer<NativeCompressResult> out,
 );
 
-// compress_batch(inputs, count, params, thread_count, chunk_size, out) -> void
+// compress_batch(inputs, count, params, thread_count, memory_budget, control,
+//                out) -> void
 typedef CompressBatchNative = Void Function(
   Pointer<NativeBatchInput> inputs,
   Size count,
   Pointer<NativeCompressParams> params,
   Uint32 threadCount,
-  Uint32 chunkSize,
+  Uint64 memoryBudget,
+  Pointer<NativeBatchControl> control,
   Pointer<NativeBatchResult> out,
 );
 typedef CompressBatchDart = void Function(
@@ -130,9 +148,14 @@ typedef CompressBatchDart = void Function(
   int count,
   Pointer<NativeCompressParams> params,
   int threadCount,
-  int chunkSize,
+  int memoryBudget,
+  Pointer<NativeBatchControl> control,
   Pointer<NativeBatchResult> out,
 );
+
+// ironpress_free_buffer(buffer) — also used as a NativeFinalizer callback.
+typedef FreeBufferNative = Void Function(Pointer<Void> buffer);
+typedef FreeBufferDart = void Function(Pointer<Void> buffer);
 
 // free_compress_result(result)
 typedef FreeCompressResultNative = Void Function(
@@ -162,6 +185,8 @@ final class NativeProbeResult extends Struct {
   external int fileSize;
   @Uint32()
   external int hasExif;
+  @Uint32()
+  external int orientation;
   @Int32()
   external int errorCode;
   external Pointer<Utf8> errorMessage;
@@ -285,7 +310,8 @@ class NativeBindings {
     this.freeBenchmarkResult,
     this.version,
     this.abiVersion,
-  );
+    this.freeBufferPointer,
+  ) : freeBuffer = freeBufferPointer.asFunction<FreeBufferDart>();
 
   factory NativeBindings.fromLibrary(DynamicLibrary lib) {
     return NativeBindings._(
@@ -323,6 +349,7 @@ class NativeBindings {
       lib.lookupFunction<AbiVersionNative, AbiVersionDart>(
         'ironpress_abi_version',
       ),
+      lib.lookup<NativeFunction<FreeBufferNative>>('ironpress_free_buffer'),
     );
   }
 
@@ -340,4 +367,8 @@ class NativeBindings {
   final FreeBenchmarkResultDart freeBenchmarkResult;
   final VersionDart version;
   final AbiVersionDart abiVersion;
+
+  /// `ironpress_free_buffer`, usable as a [NativeFinalizer] callback.
+  final Pointer<NativeFunction<FreeBufferNative>> freeBufferPointer;
+  final FreeBufferDart freeBuffer;
 }

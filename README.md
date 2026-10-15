@@ -26,17 +26,17 @@
 > - Added an install_name normalization step to the CI build workflow so future prebuilt macOS binaries stay relocatable.
 > - Added Swift Package Manager support for iOS and macOS (CocoaPods remains supported). Both integrations embed the same prebuilt dynamic `ironpress_native.xcframework`.
 
-ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwebp, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call; batch work is orchestrated chunk-by-chunk in Dart and each chunk is processed natively, which keeps progress and cancellation deterministic. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
+ironpress compresses JPEG, PNG, and WebP images using mozjpeg, oxipng, and libwebp, compiled as native Rust libraries. mozjpeg and oxipng are **state-of-the-art compression engines** trusted by major CDNs and tech companies. Single-image operations run in one native call, and a batch normally runs in a single native call too: progress and cancellation go through a small shared native block, so no core idles waiting for a slow image. Compressed bytes are handed back to Dart without copying. Accepts JPEG, PNG, WebP, GIF, BMP, and TIFF as input.
 
 ## Features
 
 - **mozjpeg JPEG compression** with trellis quantization (25-35% smaller than standard encoders)
 - **oxipng PNG optimization**, lossless and multithreaded
 - **WebP lossy and lossless** encoding
-- **Target file size** in a single FFI call (binary search runs entirely in Rust, zero round-trips)
+- **Target file size** in a single FFI call (quality search runs entirely in Rust, zero round-trips)
 - **Parallel batch compression** via Rayon with work-stealing across all cores
 - **Byte-identical output** on Android, iOS, and Windows
-- **Deterministic progress callbacks** and **cancellation tokens** for batch operations
+- **Live progress callbacks** and **cancellation tokens** for batch operations, with a configurable memory budget
 - **Quality presets** (low, medium, high) for common use cases
 - **Image probe** reads dimensions, format, and EXIF presence without decoding pixels
 - **Quality benchmark sweep** to find optimal compression settings
@@ -87,7 +87,7 @@ No ProGuard or R8 rules required. ironpress loads native libraries via dart:ffi 
 
 ### Target File Size
 
-Pass `maxFileSize` and the engine handles the entire binary search in Rust with no round-trips to Dart.
+Pass `maxFileSize` and the engine handles the entire quality search in Rust with no round-trips to Dart.
 
 ```dart
 final result = await Ironpress.compressFile(
@@ -101,7 +101,9 @@ print('Quality: ${result.qualityUsed}, Iterations: ${result.iterations}');
 
 Compress entire galleries in parallel across all available cores. Progress callbacks and cancellation are built in.
 
-Progress is reported at chunk boundaries, so smaller `chunkSize` values give finer-grained updates. The callback is monotonic and emits the final `(total, total)` update exactly once. Cancellation works with or without `onProgress`, is observed between chunks, and preserves results for work that already completed.
+Progress is polled from the running native batch (about every 16 ms), so updates arrive while images finish rather than at chunk boundaries. The callback is monotonic, never repeats a value and emits the final `(total, total)` update exactly once. Cancellation works with or without `onProgress`: images that have not started are skipped, running ones finish, and the result holds the processed images (a prefix of the inputs).
+
+Images run concurrently only while their estimated peak memory fits `memoryBudgetBytes` (default 512 MB, shared process-wide across concurrent batches), so large photos are not all decoded at once. `chunkSize` only matters for large in-memory (`data`) batches (more than a quarter of the budget), which are copied to native memory chunk by chunk.
 
 ```dart
 final token = CancellationToken();
@@ -300,7 +302,7 @@ cargo build --release
 | `-2` | Invalid UTF-8 in path or empty input buffer |
 | `-3` | Failed to read input file |
 | `-4` | Failed to write output file |
-| `-5` | Input too large (exceeds 256 MB limit) |
+| `-5` | Input too large (file/buffer over 256 MB, or image over 100 MP) |
 | `-10` | Compression engine error (decode failure, unsupported format) |
 | `-99` | Internal panic during batch item (OOM or corrupt image, other items unaffected) |
 | `-100` | Batch isolate crashed unexpectedly |

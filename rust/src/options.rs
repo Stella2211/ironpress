@@ -76,6 +76,10 @@ pub struct CompressParams {
     pub jpeg_trellis: u32,
     /// PNG optimization level 0-6 (default 2).
     pub png_optimization_level: u32,
+    /// 1 = use `png_optimization_level` as-is on every image size; 0
+    /// (default) = levels above 2 are lowered automatically for large
+    /// images (see `compress::effective_png_level`).
+    pub png_level_unbounded: u32,
 }
 
 impl Default for CompressParams {
@@ -93,6 +97,7 @@ impl Default for CompressParams {
             jpeg_chroma_subsampling: 0,
             jpeg_trellis: 1,
             png_optimization_level: 2,
+            png_level_unbounded: 0,
         }
     }
 }
@@ -100,7 +105,8 @@ impl Default for CompressParams {
 /// Compression result returned to Dart via FFI.
 #[repr(C)]
 pub struct CompressResult {
-    /// Pointer to compressed data. Caller must free with `free_compress_result`.
+    /// Pointer to compressed data, owned by `buffer`. Null when there is no
+    /// in-memory output.
     pub data: *mut u8,
     /// Length of compressed data in bytes.
     pub data_len: usize,
@@ -112,7 +118,8 @@ pub struct CompressResult {
     pub height: u32,
     /// Actual quality used (may differ from requested if max_file_size was set).
     pub quality_used: u32,
-    /// Number of compression iterations attempted (1 if no max_file_size).
+    /// Number of encode attempts (every full encode, including the trial
+    /// encodes of the target-size search). 1 when `max_file_size` is 0.
     pub iterations: u32,
     /// Whether the image was auto-resized to meet max_file_size. 1 = yes.
     pub resized_to_fit: u32,
@@ -120,6 +127,11 @@ pub struct CompressResult {
     pub error_code: i32,
     /// Error message (null-terminated C string). Null if no error.
     pub error_message: *mut libc::c_char,
+    /// Opaque owner of `data` (null when `data` is null). The caller either
+    /// leaves it in place and calls `free_compress_result`, or takes it over
+    /// (setting this field to null) and later releases it with
+    /// `ironpress_free_buffer` — e.g. as a Dart `NativeFinalizer` token.
+    pub buffer: *mut libc::c_void,
 }
 
 // Safety: CompressResult only contains raw pointers that are either null
@@ -136,11 +148,9 @@ impl CompressResult {
         iterations: u32,
         resized_to_fit: bool,
     ) -> Self {
-        let data_len = data.len();
-        let boxed = data.into_boxed_slice();
-        let ptr = Box::into_raw(boxed) as *mut u8;
+        let (data_ptr, data_len, buffer) = OutputBuffer::into_raw(data);
         Self {
-            data: ptr,
+            data: data_ptr,
             data_len,
             original_size,
             width,
@@ -150,6 +160,7 @@ impl CompressResult {
             resized_to_fit: if resized_to_fit { 1 } else { 0 },
             error_code: 0,
             error_message: std::ptr::null_mut(),
+            buffer,
         }
     }
 
@@ -166,6 +177,7 @@ impl CompressResult {
             resized_to_fit: 0,
             error_code: code,
             error_message: c_msg.into_raw(),
+            buffer: std::ptr::null_mut(),
         }
     }
 
@@ -189,6 +201,53 @@ impl CompressResult {
             resized_to_fit: if resized_to_fit { 1 } else { 0 },
             error_code: 0,
             error_message: std::ptr::null_mut(),
+            buffer: std::ptr::null_mut(),
+        }
+    }
+
+    /// Release the owned allocations (output buffer and error message) and
+    /// null the pointers. Safe to call more than once.
+    ///
+    /// # Safety
+    /// `buffer` and `error_message` must be null or owned by this result.
+    pub unsafe fn release(&mut self) {
+        unsafe {
+            OutputBuffer::free(self.buffer);
+            if !self.error_message.is_null() {
+                drop(std::ffi::CString::from_raw(self.error_message));
+            }
+        }
+        self.buffer = std::ptr::null_mut();
+        self.data = std::ptr::null_mut();
+        self.data_len = 0;
+        self.error_message = std::ptr::null_mut();
+    }
+}
+
+/// Owner of an output buffer handed to the caller without copying or
+/// reallocating it: the encoder's `Vec` is boxed as-is (its spare capacity
+/// included), so no `into_boxed_slice` shrink/realloc happens.
+pub struct OutputBuffer;
+
+impl OutputBuffer {
+    /// Returns `(data, len, handle)`; all null/0 for an empty vector.
+    pub fn into_raw(data: Vec<u8>) -> (*mut u8, usize, *mut libc::c_void) {
+        if data.is_empty() {
+            return (std::ptr::null_mut(), 0, std::ptr::null_mut());
+        }
+        let mut boxed = Box::new(data);
+        let ptr = boxed.as_mut_ptr();
+        let len = boxed.len();
+        (ptr, len, Box::into_raw(boxed) as *mut libc::c_void)
+    }
+
+    /// Free a handle returned by [`OutputBuffer::into_raw`]. Null is a no-op.
+    ///
+    /// # Safety
+    /// `handle` must be null or a live handle from `into_raw`, freed once.
+    pub unsafe fn free(handle: *mut libc::c_void) {
+        if !handle.is_null() {
+            drop(unsafe { Box::from_raw(handle as *mut Vec<u8>) });
         }
     }
 }
@@ -222,13 +281,27 @@ unsafe impl Sync for BatchInput {}
 pub struct BatchResult {
     /// Pointer to array of CompressResult. Caller must free with `free_batch_result`.
     pub results: *mut CompressResult,
-    /// Number of results in the array.
+    /// Number of results in the array: every input, or — when the batch was
+    /// cancelled through its [`BatchControl`] — the inputs started before
+    /// the cancellation (always a prefix of the inputs).
     pub count: usize,
     /// Total wall-clock time in milliseconds for the entire batch.
     pub elapsed_ms: u64,
-    /// Reserved for ABI compatibility with previously shipped binaries.
-    /// Always null in current builds.
-    pub completed: *mut u32,
+}
+
+/// Shared progress/cancellation block of a batch call, owned by the caller
+/// and readable/writable from other threads while `compress_batch` runs.
+///
+/// Both fields are 32-bit words so that plain aligned loads/stores from the
+/// caller (e.g. Dart `Pointer<Uint32>` on 32-bit ARM) are single-copy atomic.
+#[repr(C)]
+pub struct BatchControl {
+    /// Number of finished items (successful or failed). Incremented by the
+    /// engine; it is never reset, so one block can span several calls.
+    pub completed: std::sync::atomic::AtomicU32,
+    /// Set to non-zero by the caller to cancel: items that have not started
+    /// yet are skipped, running items finish.
+    pub cancelled: std::sync::atomic::AtomicU32,
 }
 
 // ─── Probe Types ─────────────────────────────────────────────────────────────
@@ -246,6 +319,9 @@ pub struct ProbeResult {
     pub file_size: usize,
     /// Whether EXIF metadata is present. 1 = yes.
     pub has_exif: u32,
+    /// EXIF orientation 1-8 (1 when absent). `width`/`height` are the stored
+    /// dimensions; the display orientation swaps them for 5-8.
+    pub orientation: u32,
     /// Error code: 0 = success.
     pub error_code: i32,
     /// Error message (null-terminated C string). Null if no error.
@@ -253,13 +329,21 @@ pub struct ProbeResult {
 }
 
 impl ProbeResult {
-    pub fn success(width: u32, height: u32, format: u32, file_size: usize, has_exif: bool) -> Self {
+    pub fn success(
+        width: u32,
+        height: u32,
+        format: u32,
+        file_size: usize,
+        has_exif: bool,
+        orientation: u8,
+    ) -> Self {
         Self {
             width,
             height,
             format,
             file_size,
             has_exif: if has_exif { 1 } else { 0 },
+            orientation: u32::from(orientation),
             error_code: 0,
             error_message: std::ptr::null_mut(),
         }
@@ -273,6 +357,7 @@ impl ProbeResult {
             format: 0,
             file_size: 0,
             has_exif: 0,
+            orientation: 0,
             error_code: code,
             error_message: c_msg.into_raw(),
         }

@@ -164,6 +164,42 @@ void main() {
     });
   });
 
+  group('PngOptions large-image limit', () {
+    test('is enabled by default and can be turned off', () {
+      expect(const PngOptions().limitLevelForLargeImages, isTrue);
+      expect(
+        const PngOptions(
+          optimizationLevel: 6,
+          limitLevelForLargeImages: false,
+        ).limitLevelForLargeImages,
+        isFalse,
+      );
+    });
+  });
+
+  group('ImageProbe orientation', () {
+    test('defaults to 1 and is shown when rotated', () {
+      const plain = ImageProbe(
+        width: 4,
+        height: 2,
+        format: ImageFormat.png,
+        fileSize: 10,
+        hasExif: false,
+      );
+      expect(plain.orientation, 1);
+      expect(plain.toString(), isNot(contains('orientation')));
+      const rotated = ImageProbe(
+        width: 4,
+        height: 2,
+        format: ImageFormat.jpeg,
+        fileSize: 10,
+        hasExif: true,
+        orientation: 6,
+      );
+      expect(rotated.toString(), contains('orientation 6'));
+    });
+  });
+
   group('CompressInput', () {
     test('accepts path', () {
       const input = CompressInput(path: '/tmp/photo.jpg');

@@ -81,14 +81,34 @@ class JpegOptions {
 /// Advanced PNG optimization options.
 @immutable
 class PngOptions {
-  const PngOptions({this.optimizationLevel = 2});
+  const PngOptions({
+    this.optimizationLevel = 2,
+    this.limitLevelForLargeImages = true,
+  });
 
   /// Optimization level 0-6. Higher = slower but smaller output.
   ///
   /// - 0: No optimization (fastest)
   /// - 2: Good balance (default)
   /// - 6: Maximum compression (slowest)
+  ///
+  /// Levels above 2 are lowered for large images unless
+  /// [limitLevelForLargeImages] is `false`.
   final int optimizationLevel;
+
+  /// Lower [optimizationLevel] automatically for large images so a single
+  /// PNG encode cannot take minutes. Default: `true`.
+  ///
+  /// Applies to the size being encoded (after any resize):
+  /// - up to 3.75 MP: the requested level is used;
+  /// - above 3.75 MP up to 12 MP: at most level 4;
+  /// - above 12 MP: at most level 2.
+  ///
+  /// Levels 0-2 are never changed. For reference, a worst-case 12 MP image
+  /// takes about 6 s at level 2, 10.6 s at level 4 and 34 s at level 6 on an
+  /// Apple M-series Mac (phones are several times slower). Set to `false`
+  /// to always use [optimizationLevel] as given.
+  final bool limitLevelForLargeImages;
 }
 
 // ─── Quality Presets ─────────────────────────────────────────────────────────
@@ -188,7 +208,10 @@ class CompressInput {
 
 // ─── Cancellation ────────────────────────────────────────────────────────────
 
-/// Token for cancelling batch compression between chunks.
+/// Token for cancelling a batch compression.
+///
+/// Cancelling stops the batch from starting new images; images already
+/// being compressed finish, and their results are returned.
 ///
 /// ```dart
 /// final token = CancellationToken();
@@ -211,8 +234,8 @@ class CancellationToken {
   /// Whether cancellation has been requested.
   bool get isCancelled => _cancelled;
 
-  /// Request cancellation. The batch will stop after the current chunk
-  /// completes and return partial results.
+  /// Request cancellation. The batch stops starting new images, lets the
+  /// running ones finish and returns their (partial) results.
   void cancel() {
     if (_cancelled) {
       return;
@@ -277,7 +300,11 @@ class CompressResult {
   /// May differ from requested if [maxFileSize] was set.
   final int qualityUsed;
 
-  /// Number of compression iterations (1 if no [maxFileSize]).
+  /// Number of encode attempts (encoder runs) made. 1 without
+  /// [maxFileSize] (including the direct PNG optimization path). With
+  /// [maxFileSize] this counts every quality/size trial of the target-size
+  /// search, including fast PNG trial encodes, so it measures the encoding
+  /// work spent rather than a number of search "rounds".
   final int iterations;
 
   /// Whether the image was auto-resized to meet the file size target.
@@ -424,12 +451,16 @@ class ImageProbe {
     required this.format,
     required this.fileSize,
     required this.hasExif,
+    this.orientation = 1,
   });
 
-  /// Image width in pixels.
+  /// Image width in pixels, as stored in the file (before applying any
+  /// EXIF orientation; compression outputs are rotated, so a 90° orientation
+  /// swaps width and height there — see [orientation]).
   final int width;
 
-  /// Image height in pixels.
+  /// Image height in pixels, as stored in the file (before applying any
+  /// EXIF orientation).
   final int height;
 
   /// Detected image format.
@@ -440,6 +471,13 @@ class ImageProbe {
 
   /// Whether EXIF metadata is present.
   final bool hasExif;
+
+  /// EXIF orientation (1-8), or 1 when the image declares none.
+  ///
+  /// [width] and [height] are the stored dimensions. Compression applies the
+  /// orientation, so the displayed (and compressed) image has width and
+  /// height swapped when [orientation] is 5-8.
+  final int orientation;
 
   /// Total pixel count.
   int get pixelCount => width * height;
@@ -452,7 +490,8 @@ class ImageProbe {
       'ImageProbe(${width}x$height, ${format.name}, '
       '${formatBytes(fileSize)}, '
       '${megapixels.toStringAsFixed(1)}MP'
-      '${hasExif ? ', EXIF' : ''})';
+      '${hasExif ? ', EXIF' : ''}'
+      '${orientation != 1 ? ', orientation $orientation' : ''})';
 }
 
 // ─── Benchmark Result ────────────────────────────────────────────────────────
